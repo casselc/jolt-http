@@ -295,6 +295,13 @@ jolt-tcp rather than merely copying the current adapter.
 - safe broken-pipe behavior; and
 - structured errors with native state captured at the failing call.
 
+Deadline-bearing operations first require a real monotonic clock:
+`System/nanoTime` currently derives from UTC wall-clock milliseconds and can
+jump. Non-blocking connect must expose in-progress separately and verify
+`SO_ERROR` after readiness. TLS adapters must preserve `WANT_READ`,
+`WANT_WRITE`, clean `close_notify`, and truncated transport EOF as distinct
+states.
+
 TLS may remain layered, but the existing Maven HTTP client must have a clear
 migration path.
 
