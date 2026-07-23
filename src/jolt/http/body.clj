@@ -196,9 +196,10 @@
   "A blocking Sink over a teensyp Socket. Each write queues to the socket and
   parks the calling thread on a promise until the bytes are flushed.
 
-  Note this consumes a worker-pool thread for the duration of the body, and the
-  write callback that unparks it is itself queued to that same pool — see the
-  `:pool-size` note in jolt.http.server."
+  This consumes a handler-pool thread for the duration of the body. jolt-tcp
+  deliberately runs the write callback which unparks it on a separate callback
+  executor, avoiding handler-pool self-starvation; see the `:pool-size` note in
+  jolt.http.server."
   ([socket] (socket-sink socket nil))
   ([socket on-close]
    (let [lock     (java.util.concurrent.locks.ReentrantLock.)

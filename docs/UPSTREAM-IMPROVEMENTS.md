@@ -352,9 +352,10 @@ small API until a registry delivers more than nominal parity.
 - Correct documentation that calls the v0.4.15 cached executor unbounded; the
   current shim is fixed at 32. Preserve the FFI crash as a separate,
   evidence-seeking runtime issue.
-- Make jolt-tcp stop deterministic and leak-free before relying on it from HTTP:
-  retain reactor completion, close both wake-pipe descriptors, and free
-  per-server native buffers.
+- The local jolt-tcp fork now stops deterministically: it retains reactor
+  completion, closes both wake-pipe descriptors, frees per-server native
+  buffers, rolls back partial starts, and tests wake/close serialization. Keep
+  that lifecycle contract when migrating transport primitives upstream.
 - The HTTP parser, keep-alive/pipelining, content-length/chunking, Ring-shaped
   contract, and bounded handler default remain library policy.
 

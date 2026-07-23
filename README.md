@@ -233,12 +233,15 @@ regression.
 - **The `Date` header** is computed here (jolt's core has no `java.time`) and
   cached for the current second.
 - **No `:direct-read-buffer?`** — jolt has no direct buffers.
-- **The default executor is a bounded pool.** Capra uses a virtual-thread-per-
-  task executor; jolt has no virtual threads, so the direct translation would be
-  one OS thread per in-flight blocking handler. Under a burst of concurrent
-  streaming responses that spawns enough threads doing concurrent FFI to crash
-  Chez, so the pool is bounded instead and excess requests queue. Raise
-  `:pool-size` for blocking workloads.
+- **The default executor is an explicitly bounded pool.** Capra uses a
+  virtual-thread-per-task executor, but jolt has no M:N virtual threads. In
+  v0.4.15 the cached, virtual-thread, and work-stealing constructor shims all
+  map to a fixed 32-worker implementation, so none provides Capra's scaling
+  semantics. A separate high-concurrency native-I/O workload has ended in
+  Chez's `nonrecoverable invalid memory reference`, but that runtime safety case
+  still needs a minimal reproducer. This server therefore keeps configurable
+  bounded policy and queues excess requests; raise `:pool-size` deliberately
+  for blocking workloads.
 
   This does not deadlock even though a handler may block waiting for one of its
   own writes: jolt-tcp runs write-completion callbacks on a separate executor,

@@ -87,15 +87,17 @@
   - `:write-queue-size` - the max number of writes in the queue (default 64)"
   [handler & {:as options}]
   (let [options  (merge default-options options)
-        ;; A *bounded* pool. Capra uses a virtual-thread-per-task executor, and
-        ;; the obvious translation is a cached pool — but jolt has no virtual
-        ;; threads, so that means one OS thread per in-flight blocking handler,
-        ;; and a burst of concurrent streaming responses spawns enough threads
-        ;; doing concurrent FFI to crash Chez outright ("nonrecoverable invalid
-        ;; memory reference"). Bounded is the safe default here.
+        ;; A configurable bounded pool. Capra uses a virtual-thread-per-task
+        ;; executor, but jolt has no M:N virtual threads. In v0.4.15 the
+        ;; cached, virtual-thread, and work-stealing constructor shims all map to
+        ;; one fixed 32-worker implementation, so none provides Capra's scaling
+        ;; semantics. A separate high-concurrency native-I/O workload has ended
+        ;; in Chez's "nonrecoverable invalid memory reference"; that runtime
+        ;; safety case still needs a minimal reproducer. Keep explicit bounded
+        ;; policy here rather than relying on a misleading constructor name.
         ;;
         ;; Bounding the handler pool does not reintroduce the deadlock that the
-        ;; cached pool was avoiding: jolt-tcp runs write-completion callbacks on
+        ;; alternate pool was avoiding: jolt-tcp runs write-completion callbacks on
         ;; a separate executor, so a handler blocked on its own write is always
         ;; released, however small this pool is. Excess requests queue instead.
         executor (or (:executor options)
