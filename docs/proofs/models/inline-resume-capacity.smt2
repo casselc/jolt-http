@@ -1,0 +1,20 @@
+; Bounded model of synchronous inline response completion while the parser
+; remains WORKING. Chiasmus adds check-sat/model/core commands.
+; Domain: 0..128 responses and positive queue capacity 1..64.
+(declare-const requests Int)
+(declare-const capacity Int)
+(declare-const inline_resumes_per_response Int)
+(declare-const queued_controls Int)
+(declare-const violation Bool)
+
+(assert (! (and (<= 0 requests) (<= requests 128))
+           :named requests_in_domain))
+(assert (! (and (<= 1 capacity) (<= capacity 64))
+           :named capacity_in_domain))
+(assert (! (= inline_resumes_per_response 0)
+           :named inline_completion_skips_resume))
+(assert (! (= queued_controls (* requests inline_resumes_per_response))
+           :named queued_controls_definition))
+(assert (! (= violation (> queued_controls capacity))
+           :named violation_definition))
+(assert (! violation :named queried_control_overflow))

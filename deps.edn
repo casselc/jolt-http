@@ -1,0 +1,25 @@
+;; jolt-http — a Capra-style HTTP/1.1 server for jolt (Clojure on Chez Scheme).
+;; An incremental HTTP/1.1 parser and Ring-shaped handler contract layered over
+;; jolt-tcp's poll(2) reactor. Run tests with `joltc -M:test`.
+;;
+;; jolt-tcp declares the libc :jolt/native spec it needs, and jolt collects
+;; :jolt/native declarations from every dep in the tree, so it must NOT be
+;; redeclared here.
+{:paths ["src"]
+
+ :deps {jolt-lang/jolt-tcp {:local/root "../jolt-tcp"}}
+
+ ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
+ ;; it lives in :extra-deps rather than :deps. Pinned to the peeled commit behind
+ ;; release tag v0.1.2. Because the dep is
+ ;; alias-scoped, the installer needs the alias too:
+ ;; `JOLT_CACHE_DIR=.jolt-cache/jolt-hegel-<sha> joltc -A:test -m hegel.install`
+ ;; (the cache is keyed by the pinned SHA so another release cannot reuse its
+ ;; compiled namespaces).
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {io.github.chucklehead-dev/jolt-hegel
+                               {:git/url "https://github.com/chucklehead-dev/jolt-hegel.git"
+                                :git/sha "ffe523023437862c7e474dc216346426318754c6"}}
+                  :main-opts ["-m" "jolt.http.server-test"]}}
+
+ :tasks {test "joltc -M:test"}}
