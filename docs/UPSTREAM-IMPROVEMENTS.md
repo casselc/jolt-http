@@ -356,6 +356,9 @@ small API until a registry delivers more than nominal parity.
   completion, closes both wake-pipe descriptors, frees per-server native
   buffers, rolls back partial starts, and tests wake/close serialization. Keep
   that lifecycle contract when migrating transport primitives upstream.
+- Supplied handler and callback executors are now borrowed by default; HTTP
+  applications can share longer-lived pools safely unless they explicitly opt
+  into jolt-tcp shutdown ownership.
 - The HTTP parser, keep-alive/pipelining, content-length/chunking, Ring-shaped
   contract, and bounded handler default remain library policy.
 
