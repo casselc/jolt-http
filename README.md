@@ -2,10 +2,10 @@
 
 A [Capra][]-style HTTP/1.1 server for **[jolt][]** (Clojure on Chez Scheme) — no
 JVM, no Java NIO. It layers an incremental HTTP/1.1 parser and a Ring-shaped
-handler contract over [jolt-tcp][]'s `poll(2)` reactor.
+handler contract over [jolt-tcp][]'s `jolt.net`-backed readiness reactor.
 
 This is to Capra what jolt-tcp is to teensyp: a native reimplementation of the
-adapter for jolt's FFI sockets. It replaces [ring-chez-adapter][], which read
+adapter over jolt-tcp's owned sockets. It replaces [ring-chez-adapter][], which read
 each request into a String, served one request per connection, and always closed.
 
 Supports HTTP/1.1 only: keep-alive, pipelining, chunked request and response
@@ -13,7 +13,7 @@ bodies, streaming request bodies, file responses, and async handlers.
 
 [capra]: https://github.com/weavejester/capra
 [jolt]: https://github.com/jolt-lang/jolt
-[jolt-tcp]: https://github.com/jolt-lang/jolt-tcp
+[jolt-tcp]: https://github.com/casselc/jolt-tcp
 [ring-chez-adapter]: https://github.com/jolt-lang/ring-chez-adapter
 
 ## Usage
@@ -87,6 +87,19 @@ support your own type:
       (body/sink-write! sink bs 0 (alength bs)))))
 ```
 
+`write-body-to-sink` is synchronous: it must finish producing the body before
+returning and must not retain the sink. The adapter closes the sink exactly once
+after the call returns; a custom implementation may close it early because
+close is idempotent. `:async?` controls Ring handler completion, not body
+production. A future asynchronous producer needs an explicit completion and
+cancellation SPI rather than retaining this blocking sink.
+
+Each sink write blocks on jolt-tcp's outcome-bearing completion. A native write
+failure therefore throws back through `write-body-to-sink`/`respond` and retires
+the connection; it cannot strand the producing handler on a success-only
+callback. An async handler may catch that exception in the task which called
+`respond`.
+
 Note that protocol dispatch on `java.io.File` does not work on jolt (both
 `extend-protocol` and `extend` fall through to `Object`), so files are dispatched
 by an explicit `instance?` test internally.
@@ -99,15 +112,18 @@ by an explicit `instance?` test internally.
 | `:control-queue-size`   | The max number of queued control events              | 32          |
 | `:error-handler`        | An async Ring handler called on uncaught exceptions  | 500 response|
 | `:error-logger`         | A function that takes an exception and logs it       | prints       |
-| `:executor`             | An executor for handler calls                        | fixed pool  |
+| `:executor`             | Borrowed executor for handler calls                  | fixed pool  |
 | `:pool-size`            | Size of the default handler pool                     | 32          |
 | `:port`                 | The port number to listen on                         | 80          |
-| `:read-buffer-size`     | Read buffer size; bounds the request line + headers  | 8K          |
+| `:read-buffer-size`     | Read buffer size; bounds one request/header line     | 8K          |
+| `:max-header-bytes`     | Maximum aggregate header-section bytes incl. CRLF    | 64K         |
+| `:max-header-count`     | Maximum number of request header fields              | 100         |
 | `:recv-buffer-size`     | The receive buffer size (i.e. the SO_RCVBUF option)  |             |
-| `:remote-addr`          | Reported as `:remote-addr` (jolt exposes no peer)    | 127.0.0.1   |
+| `:remote-addr`          | Optional override for the actual peer address        | peer address|
 | `:response-buffer-size` | The size of the buffer used for the response         | 32K         |
 | `:reuse-address?`       | The SO_REUSEADDR socket option                       | false       |
-| `:server-name`          | Reported as `:server-name` on requests               | 127.0.0.1   |
+| `:server-name`          | Optional override for the actual local address       | local address|
+| `:shutdown-executor?`   | Adopt and stop a supplied executor                    | false       |
 | `:stream-queue-size`    | Request body chunks buffered before backpressure     | 8           |
 | `:write-buffer-size`    | The write buffer size in bytes                       | 128K        |
 | `:write-queue-size`     | The maximum number of writes that can be queued      | 64          |
@@ -121,7 +137,7 @@ begins. The following are rejected with a 400 (or 501 where noted):
 
 - `Content-Length` together with `Transfer-Encoding` (RFC 9112 6.3).
 - Repeated `Content-Length` with differing values; a non-numeric, signed,
-  hex-prefixed or empty `Content-Length`.
+  hex-prefixed, empty, or signed-64-bit-overflowing `Content-Length`.
 - A `chunk-size` that is not `1*HEXDIG` — no `+`, `-`, `0x`, `_` or surrounding
   whitespace, and not empty.
 - Any `Transfer-Encoding` other than exactly `chunked` (501), including
@@ -140,6 +156,10 @@ begins. The following are rejected with a 400 (or 501 where noted):
 - A request method that is not a token (RFC 9110 9.1).
 - More than one `Host` field, or none (RFC 9112 3.2).
 - Any HTTP version other than `HTTP/1.1` (505).
+- A header section over `:max-header-bytes` or `:max-header-count` (431). The
+  exact configured boundary is accepted; the next byte or field is rejected.
+- EOF in a partial request line, header section, fixed-length body, chunk, or
+  trailer produces one 400 and closes. EOF while idle closes silently.
 
 On the response side:
 
@@ -150,6 +170,11 @@ On the response side:
   or NUL, is refused and turned into a 500 rather than emitted. This prevents
   HTTP response splitting (CWE-113) when a handler puts unescaped input into a
   header.
+- A non-three-digit integer status, unrepresentable `Content-Length`, or
+  transfer encoding other than exactly `chunked` is likewise replaced with a
+  safe 500 before any response byte is written. Repeated identical content
+  lengths collapse to one canonical field; valid chunked transfer encoding
+  wins over and removes content length.
 - A leading empty line before a request line is ignored (RFC 9112 2.2).
 - Chunk extensions are ignored and the trailer section is consumed, so neither
   can be misread as the start of the next request.
@@ -196,10 +221,12 @@ examples. Three layers, all folded into `joltc -M:test`:
 - **Protocol properties** (`jolt.http.protocol-property-test`) — the state
   machine driven in-process through a `teensyp.server/Socket` fake, so hundreds
   of generated message streams run in the time a handful of loopback cases take.
-  Framing invariance under every write split, Content-Length and chunked
-  agreeing, HEAD equalling GET, pipelining, response splitting, and a mutation
-  fuzz asserting every answer is well formed and terminal. A stateful model
-  generates whole request sequences on one connection.
+  Framing invariance under every write split, aggregate header boundaries,
+  Content-Length and chunked agreement, response metadata fail-closed behavior,
+  every truncated EOF prefix, HEAD equalling GET, pipelining, response
+  splitting, and a mutation fuzz asserting every answer is well formed and
+  terminal. A stateful model generates whole request sequences on one
+  connection.
 - **Loopback properties** (`jolt.http.server-property-test`) — what the fake
   cannot reach: the reactor's send loop, write-credit accounting, backpressure
   on a real sender, and a genuine half-close.
@@ -216,7 +243,10 @@ stress.
 The bounded [inline-response control-capacity
 proof](docs/proofs/inline-resume-capacity.md) records the source facts, Z3
 counterexample query and semantic controls behind the synchronous pipelining
-regression.
+regression. The bounded [response-validation, terminal-EOF, and
+sink-finalization proofs](docs/proofs/http-fail-closed.md) record the
+fail-closed models, known-bug controls, non-vacuity witnesses, and their
+implementation-test boundaries.
 
 ## Differences from Capra
 
@@ -249,10 +279,20 @@ regression.
   one pool deadlocks at exactly `pool-size` concurrent streaming responses —
   that is why jolt-tcp grew a `:callback-executor`.)
 
+  An executor created by jolt-http is transferred to jolt-tcp and shut down as
+  part of deterministic server cleanup. A supplied `:executor` is borrowed by
+  default; pass `:shutdown-executor? true` to transfer its ownership explicitly.
+
+- **Connection metadata is truthful.** `:server-port` comes from the bound local
+  endpoint, including the kernel-selected port after `:port 0`;
+  `:server-name` and `:remote-addr` default to the actual numeric local and peer
+  addresses. Their options remain explicit overrides for proxy deployments.
+
 ## Testing
 
-```
-joltc -M:test
+```sh
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -A:test -m hegel.install
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -M:test
 ```
 
 Runs a framework-less acceptance suite plus three generative layers
@@ -265,9 +305,15 @@ instead of failing it.
 
 Run a subset by naming scenarios:
 
+```sh
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
+  -M:test "pipelining" "keep-alive"
 ```
-joltc -M:test "pipelining" "keep-alive"
-```
+
+The current reviewed core baseline is
+`ecf7728f15d8b8f858327c47dbd8b751eb36798c`. `deps.edn` pins jolt-tcp at
+`81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins jolt-net
+at `eabf9067f32d0f4c1673b5d84c24484943ea75c5`.
 
 Progress is also written to `/tmp/jolt-http-test-progress.log`; jolt block-buffers
 stdout when it is redirected, so on a hang that file is the only record of how

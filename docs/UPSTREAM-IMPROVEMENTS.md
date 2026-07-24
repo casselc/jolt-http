@@ -14,16 +14,37 @@ Revalidated 2026-07-23 against:
 - the current local jolt-http and jolt-tcp sources.
 
 jolt-http has no direct FFI. It layers an HTTP/1.1 parser and Ring-shaped handler
-contract over jolt-tcp's poll reactor, so native safety and byte-transfer
+contract over jolt-tcp's `jolt.net`-backed readiness reactor, so native safety and byte-transfer
 changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
-The separate local Jolt proposal fork has the initial packages 2--5 checkpoint
-at `3105198a`, the fail-closed target correction at `34fabb2c`, and the AOT
-proof record through `6df64292`, followed by the host-class registration seam at
-`287f9022`. Its known-unsound runtime AOT prototype is isolated on
-`research/aot-v5-prototype` at `21062d5b`; none of these commits has been pushed
-and no pull request has been opened.
+The reviewed Jolt proposal fork is published only to `casselc/jolt` on
+`codex/upstream-improvements-6-8`; nothing has been pushed to the upstream
+project's origin and no pull request has been opened. Its current HTTP
+prerequisites include scoped array ranges at `1c8fdb97`, Windows path handling
+at `358c42b7`, and the variadic FFI boundary at `ecf7728f`. The known-unsound
+runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
+`21062d5b` and is not part of the proposal branch.
+
+## Implementation update — 2026-07-24
+
+- Production namespaces depend only on jolt-tcp. They import neither
+  `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
+  failure injection.
+- `deps.edn` pins jolt-tcp at
+  `81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins the
+  validated jolt-net revision. CI resolves this immutable graph directly rather
+  than cloning mutable sibling branches.
+- Response writes use TCP's outcome-bearing completion API, so reset/failure
+  paths unblock blocking producers and preserve the first native failure as a
+  direct exception or closed-socket cause.
+- Request EOF is terminal in every parser state; aggregate header count/bytes
+  and signed-long Content-Length bounds are explicit. Response status and
+  framing metadata are validated and canonicalized before serialization, and
+  synchronous streamable bodies finalize their sink exactly once observably.
+- Fixed, Hegel, SMT, and Prolog controls cover those boundaries. Remaining
+  recommendations below are broader runtime/SPI work, not descriptions of
+  workarounds still present in this adapter.
 
 ## Priority summary
 
@@ -35,6 +56,7 @@ and no pull request has been opened.
 | P1 | Jolt host shims | Make type tests and protocol dispatch agree | Remove silent `java.io.File` fallthrough |
 | P1 | Jolt threads | Daemon threads or daemon core.async infrastructure | Let a server process exit normally |
 | P1 | Jolt/jolt-tcp bytes | Bulk array copy and range-aware native transfer | Remove inherited transport copies and body-range loops |
+| P1 | jolt-tcp completion | Outcome-bearing write completion | Prevent a reset peer from stranding a blocking body producer |
 | P2 | Jolt runtime | Genuine M:N lightweight tasks | Scale blocking handlers without one OS thread each |
 | P2 | Jolt stdlib | Shared byte input/output protocols | Replace local request-body and response-sink shapes |
 | P2 | Jolt stdlib | Cross-platform `jolt.net` with peer address | Report real clients and inherit audited socket behavior |
@@ -279,10 +301,15 @@ and driven by measured needs.
 
 ### Local proposal status
 
-Jolt proposal commit `3105198a` implements the overlap/range API and passes
-17/17 focused correctness checks. It avoids intermediate Jolt arrays, but the
-FFI host path still copies per byte and no before/after allocation or throughput
-benchmark has been recorded. Treat the performance criterion as open.
+The reviewed fork now implements overlap-safe `System/arraycopy`, bulk native
+array transfers, whole-array borrowing, and scoped nonzero-offset byte-array
+borrowing. Commit `1c8fdb97eee58870b9fb9de928430d016c0cf06d` is the current
+byte-slice implementation; the current HTTP/transport baseline is its descendant
+`ecf7728f15d8b8f858327c47dbd8b751eb36798c`, which also rejects executor
+submissions after shutdown and preserves drive-rooted project paths on Windows.
+`jolt.net` and jolt-tcp use those borrowed ranges
+for socket I/O, including partial sends whose next position is nonzero.
+Allocation and throughput measurement remains open.
 
 ## 6. Define shared byte input and output protocols
 
@@ -309,6 +336,22 @@ Define small Jolt-native protocols for both directions:
 
 Keep HTTP framing, content length, chunked encoding, and Ring body coercion out
 of the generic protocol.
+
+The write side also needs one transport-level completion invariant: every
+accepted write completes exactly once with either success or a structured
+failure. A success-only callback is insufficient for the current blocking HTTP
+sink, because a reset peer can otherwise leave its waiting promise unresolved.
+This belongs in jolt-tcp's socket API, then in the shared output SPI, rather than
+as HTTP knowledge in `jolt.net`.
+
+The local fork now has that additive surface:
+`teensyp.server/write-completion` returns a promise settled with `:written` or
+`:failed`, while the legacy callback remains success-only. jolt-http's blocking
+socket sink consumes it and throws failures to the response-producing task. A
+deterministic connection-reset injection pins non-stranding behavior. One
+diagnostic follow-on remains in jolt-tcp: if the response head fails before the
+body completion can be admitted, the body sees `::socket-closed` rather than the
+underlying reset cause.
 
 ### Acceptance criteria
 
@@ -369,6 +412,16 @@ migration path.
 `:remote-addr` becomes truthful, platform support grows through the transport,
 and socket edge cases live in one audited implementation.
 
+### Local implementation status
+
+`jolt.net` now owns endpoints, resolution, sockets, readiness registration,
+wakeup, structured native errors, and handle generations on Linux and macOS.
+jolt-tcp is implemented over that public surface and exposes actual local/peer
+endpoint maps through `socket-info`; jolt-http derives `:server-port`,
+`:server-name`, and `:remote-addr` there without importing `jolt.net` or
+`jolt.ffi`. Windows readiness and the portable connector/deadline and broader
+stream SPIs remain follow-up work.
+
 ## 8. Expose a complete target descriptor
 
 ### Current constraint
@@ -417,13 +470,25 @@ small API until a registry delivers more than nominal parity.
 - Correct documentation that calls the v0.4.15 cached executor unbounded; the
   current shim is fixed at 32. Preserve the FFI crash as a separate,
   evidence-seeking runtime issue.
-- The local jolt-tcp fork now stops deterministically: it retains reactor
-  completion, closes both wake-pipe descriptors, frees per-server native
-  buffers, rolls back partial starts, and tests wake/close serialization. Keep
-  that lifecycle contract when migrating transport primitives upstream.
-- Supplied handler and callback executors are now borrowed by default; HTTP
-  applications can share longer-lived pools safely unless they explicitly opt
-  into jolt-tcp shutdown ownership.
+- The local jolt-tcp fork now stops deterministically: it quiesces active
+  handlers, retires jolt.net registrations and owned sockets, awaits close
+  arities and callbacks, closes its poller, and rolls back partial starts.
+- Supplied handler and callback executors are borrowed by default. jolt-http
+  explicitly transfers the bounded pool it creates to jolt-tcp, while preserving
+  borrowed ownership for a user pool unless `:shutdown-executor?` opts in.
+- jolt-http now uses actual TCP endpoint metadata, supports a truthful
+  kernel-selected `:server-port` after `:port 0`, and treats
+  `:server-name`/`:remote-addr` as explicit overrides.
+- jolt-http now rejects aggregate header overrun and unrepresentable request
+  lengths, terminates every modeled partial-request EOF, and validates response
+  status/header/framing metadata before the first byte is written. Its
+  source-derived bounded models and semantic controls are recorded in
+  [`proofs/http-fail-closed.md`](proofs/http-fail-closed.md).
+- jolt-tcp now reports outcome-bearing write completion and jolt-http consumes
+  it in the generic response sink. A peer reset either settles the queued
+  completion as failed or closes admission first; both paths throw and unblock
+  the producing task. Preserving the original close cause in the latter race is
+  a diagnostic follow-on, not a liveness gap.
 - The HTTP parser, keep-alive/pipelining, content-length/chunking, Ring-shaped
   contract, and bounded handler default remain library policy.
 

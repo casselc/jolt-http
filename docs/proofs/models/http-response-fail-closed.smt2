@@ -1,0 +1,33 @@
+; Counterexample query for response metadata validation.
+; Chiasmus supplies check-sat and unsat-core commands.
+(declare-datatypes ((StatusClass 0))
+  (((status_valid) (status_invalid))))
+(declare-datatypes ((HeaderClass 0))
+  (((headers_safe) (headers_unsafe))))
+(declare-datatypes ((ContentLengthClass 0))
+  (((cl_none) (cl_valid) (cl_invalid))))
+(declare-datatypes ((TransferEncodingClass 0))
+  (((te_none) (te_chunked) (te_invalid))))
+
+(declare-const status StatusClass)
+(declare-const headers HeaderClass)
+(declare-const content_length ContentLengthClass)
+(declare-const transfer_encoding TransferEncodingClass)
+(declare-const incomplete_or_failed Bool)
+(declare-const invalid_required_input Bool)
+(declare-const evaluator_allows Bool)
+(declare-const violation Bool)
+
+(assert (! (= incomplete_or_failed
+              (or (= status status_invalid)
+                  (= headers headers_unsafe)
+                  (= content_length cl_invalid)
+                  (= transfer_encoding te_invalid)))
+           :named incomplete_or_failed_definition))
+(assert (! (= invalid_required_input incomplete_or_failed)
+           :named invalid_required_input_definition))
+(assert (! (= evaluator_allows (not incomplete_or_failed))
+           :named evaluator_definition))
+(assert (! (= violation (and invalid_required_input evaluator_allows))
+           :named violation_definition))
+(assert (! violation :named violation_query))
