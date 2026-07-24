@@ -18,10 +18,12 @@ contract over jolt-tcp's poll reactor, so native safety and byte-transfer
 changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
-The separate local Jolt proposal fork checkpoints packages 3--5 at `3105198a`
-and the AOT proof record at `cb1ca22c`. Its known-unsound runtime AOT prototype
-is isolated on `research/aot-v5-prototype` at `21062d5b`; none of these commits
-has been pushed and no pull request has been opened.
+The separate local Jolt proposal fork has the initial packages 2--5 checkpoint
+at `3105198a`, the fail-closed target correction at `34fabb2c`, and the AOT
+proof record through `6df64292`, followed by the host-class registration seam at
+`287f9022`. Its known-unsound runtime AOT prototype is isolated on
+`research/aot-v5-prototype` at `21062d5b`; none of these commits has been pushed
+and no pull request has been opened.
 
 ## Priority summary
 
@@ -67,7 +69,7 @@ Live fixtures exposed compile-time reads of ordinary nonmacro Vars without
 Other failures crossed readers/compiler callbacks, aliases, retained namespace
 cells, direct/nested loading, and selection-time mutation.
 
-The checked-in 41-model Chiasmus/Z3 suite proves bounded gates only under
+The checked-in 44-model Chiasmus/Z3 suite proves bounded gates only under
 complete, synchronous, non-spoofable observation of every consumed compiler
 input. It does not prove instrumentation completeness. See the cross-project
 [`AOT proof record`](../../jolt-upstream/docs/aot-cache-provenance-invariants.md).
@@ -192,6 +194,20 @@ File response bodies and protocol adapters can use ordinary protocol dispatch.
 The explicit File branches and the risk of other silent shim fallthroughs
 disappear.
 
+### Local proposal status
+
+The initial File fix in `3105198a` did not close the invariant: live
+InputStream and PersistentQueue witnesses still dispatched through `Object`.
+`287f9022` adds one host-class registry and migrates File, binary
+InputStream/OutputStream, and PersistentQueue; the focused coherence gate passes
+22/22 checks. Legacy char readers/writers, NIO Path, concurrency shims,
+transients, ReaderConditional, MultiFn, and per-value htable classes remain an
+explicit migration/audit inventory, so “every supported shim” is not yet a
+completed acceptance criterion. The shared binary-stream representation cannot
+distinguish FileInputStream from ByteArrayInputStream, so the correction
+deliberately narrows those concrete `instance?` aliases to false; characterize
+downstream compatibility before proposing that behavior upstream.
+
 ## 4. Add daemon-thread/liveness control
 
 ### Current constraint
@@ -257,9 +273,16 @@ operations wait for a Java-shaped NIO design.
 
 ### jolt-http payoff
 
-Transport copies disappear underneath HTTP and response-body slicing can use
-one efficient primitive. The remaining buffer API becomes smaller and driven by
-measured needs.
+Intermediate transport arrays disappear underneath HTTP and response-body
+slicing can use one range primitive. The remaining buffer API becomes smaller
+and driven by measured needs.
+
+### Local proposal status
+
+Jolt proposal commit `3105198a` implements the overlap/range API and passes
+17/17 focused correctness checks. It avoids intermediate Jolt arrays, but the
+FFI host path still copies per byte and no before/after allocation or throughput
+benchmark has been recorded. Treat the performance criterion as open.
 
 ## 6. Define shared byte input and output protocols
 
@@ -365,6 +388,13 @@ descriptor. Unknown values must be explicit.
 Defaults can be based on real capacity and inherited native behavior can be
 reported accurately. Pool size should remain configurable and workload-aware;
 CPU count is an input, not the complete policy.
+
+### Local proposal status
+
+Jolt proposal commits `3105198a` and `34fabb2c` expose the zero-argument
+`jolt.host/target` and replace fuzzy inference with an exact Chez machine-type
+allowlist. The expanded focused suite passes 33/33 checks on Linux with
+`scheme`; Windows x86_64 and macOS arm64 still need native validation.
 
 ## 9. Add richer buffers and charset codecs only after the substrate
 
