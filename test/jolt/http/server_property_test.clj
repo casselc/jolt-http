@@ -96,19 +96,16 @@
 
 ;; --- server lifecycle ------------------------------------------------------
 
-(def ^:private port-counter (atom (+ 20200 (rand-int 600))))
-
 (defn- with-server
   "Start one server around a whole run-test! call and keep it alive until the
   call returns — shrinking and final replay both need it."
   [opts f]
-  (let [port (swap! port-counter inc)
-        srv  (apply http/run-server (:handler opts)
-                    (apply concat (merge {:port port :reuse-address? true
+  (let [srv  (apply http/run-server (:handler opts)
+                    (apply concat (merge {:port 0 :reuse-address? true
                                           :error-logger (fn [_])}
-                                         (dissoc opts :handler))))]
-    (Thread/sleep 250)                      ; readiness, once — not per case
-    (try (f port) (finally (http/stop-server srv) (Thread/sleep 150)))))
+                                         (dissoc opts :handler))))
+        port (:port srv)]
+    (try (f port) (finally (http/stop-server srv)))))
 
 ;; --- client ----------------------------------------------------------------
 

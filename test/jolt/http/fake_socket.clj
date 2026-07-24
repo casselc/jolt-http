@@ -70,7 +70,12 @@
       (swap! (:writes this) conj (snapshot buffer)))
     (when callback (callback)))
   (socket-info [_] {:local-address nil :remote-address nil :fd -1})
-  (socket-lock [this] (:lock this)))
+  (socket-lock [this] (:lock this))
+
+  tcp/CompletionSocket
+  (queue-write-completion [this buffer completion]
+    (swap! (:writes this) conj (snapshot buffer))
+    (deliver completion {:status :written})))
 
 (defn fake-socket []
   (map->FakeSocket {:lock     (java.util.concurrent.locks.ReentrantLock.)
@@ -130,6 +135,8 @@
    :server-name          "127.0.0.1"
    :remote-addr          "127.0.0.1"
    :read-buffer-size     8192
+   :max-header-bytes     65536
+   :max-header-count     100
    :response-buffer-size 32768
    :stream-queue-size    8
    :error-logger         (fn [_])
@@ -232,7 +239,10 @@
   handle-pending-read EOF-SEEN path)."
   [{:keys [socket] :as conn}]
   (when-not (flag? socket tcp/EOF)
-    (vswap! (:flags socket) bit-or (long tcp/EOF))
+    ;; Real TCP sets EOF-SEEN at the same moment it refreshes the terminal read
+    ;; view handed to the handler. This direct driver performs that refresh
+    ;; synchronously below, so publish both flags together.
+    (vswap! (:flags socket) bit-or (long tcp/EOF) (long tcp/EOF-SEEN))
     (drop-consumed! conn)
     (call-handler! conn)
     (pump! conn))

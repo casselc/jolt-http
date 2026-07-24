@@ -13,8 +13,10 @@
             [clojure.test]
             [jolt.http.body :as body]
             [jolt.http.date :as date]
+            [jolt.http.http-model :as model]
             [jolt.http.protocol :as protocol]
             [jolt.http.server :as http]
+            [jolt.net :as jnet]
             [teensyp.ffi-net :as net]
             ;; Loaded for their side effects on the run: the deftests below are
             ;; discovered by clojure.test/run-tests, the loopback properties by
@@ -45,19 +47,26 @@
 (defn- utf8 ^bytes [s] (.getBytes ^String s "UTF-8"))
 (defn- ->str [^bytes b] (when b (String. b "UTF-8")))
 
-;; Randomised base port: the harness binds a fresh port per scenario, and a
-;; fixed base would collide with a server left listening by a previous or
-;; concurrent run (which then shows up as a mysterious hang).
-(def ^:private port (atom (+ 19000 (rand-int 4000))))
-(defn- next-port [] (swap! port inc))
-
 (defn- recv-until-eof
-  "Read until the peer closes; return the accumulated String."
+  "Read until the peer closes; return the accumulated String.
+
+  A server that rejects an oversized message can close while unread request
+  bytes remain, which POSIX reports to the client as ECONNRESET rather than a
+  clean EOF. The response bytes received before that terminal signal remain
+  valid and must still be checked."
   [fd]
   (loop [acc ""]
-    (if-let [b (net/client-recv fd 8192)]
-      (recur (str acc (->str b)))
-      acc)))
+    (let [b (try
+              (net/client-recv fd 8192)
+              (catch :default e
+                (if (= :connection-reset (:jolt.net/kind (ex-data e)))
+                  ::connection-reset
+                  (throw e))))]
+      (if (= ::connection-reset b)
+        acc
+        (if b
+          (recur (str acc (->str b)))
+          acc)))))
 
 (defn- recv-for
   "Read for a bounded number of attempts, stopping once `done?` is satisfied.
@@ -84,13 +93,14 @@
         (str/ends-with? s "0\r\n\r\n")))))
 
 (defn- with-server [handler-or-opts f]
-  (let [p    (next-port)
-        opts (if (map? handler-or-opts) handler-or-opts {:handler handler-or-opts})
+  (let [opts (if (map? handler-or-opts) handler-or-opts {:handler handler-or-opts})
         srv  (apply http/run-server (:handler opts)
-                    (apply concat (merge {:port p :reuse-address? true}
-                                         (dissoc opts :handler))))]
-    (Thread/sleep 250)
-    (try (f p) (finally (http/stop-server srv) (Thread/sleep 150)))))
+                    (apply concat (merge {:port 0 :reuse-address? true}
+                                         (dissoc opts :handler))))
+        p    (:port srv)]
+    ;; jolt-tcp does not return until listener registration is live, and stop
+    ;; does not return until cleanup is complete. No readiness/cleanup sleeps.
+    (try (f p) (finally (http/stop-server srv)))))
 
 (defn- request
   "Send a raw request string, read until EOF (or a complete response), return it."
@@ -137,7 +147,27 @@
   {:status 200
    :headers {"Content-Type" "text/plain"}
    :body (pr-str (select-keys req [:request-method :uri :query-string :scheme
-                                   :protocol :server-port]))})
+                                   :protocol :server-port :server-name
+                                   :remote-addr]))})
+
+(defrecord GuardedOffsetBody [data off len])
+
+(extend-type GuardedOffsetBody
+  body/StreamableBody
+  (write-body-to-sink [this _response sink]
+    (body/sink-write! sink (:data this) (:off this) (:len this))))
+
+(defrecord SelfClosingBody [data])
+
+(extend-type SelfClosingBody
+  body/StreamableBody
+  (write-body-to-sink [this _response sink]
+    (let [data (:data this)]
+      (body/sink-write! sink data 0 (alength data))
+      ;; Custom implementations written against the original SPI may close
+      ;; explicitly. The adapter also owns finalization, and the Sink chain is
+      ;; deliberately idempotent so this still emits one terminator.
+      (body/sink-close! sink))))
 
 ;; --- scenarios -------------------------------------------------------------
 
@@ -162,10 +192,25 @@
         (check "query-string" "a=1&b=2" (:query-string m))
         (check "scheme"       :http (:scheme m))
         (check "protocol"     "HTTP/1.1" (:protocol m))
-        (check "server-port"  p (:server-port m)))
+        (check-pred "port 0 returns an actual bound port" pos? p)
+        (check "server-port comes from the actual local endpoint"
+               p (:server-port m))
+        (check "server-name comes from the actual local endpoint"
+               "127.0.0.1" (:server-name m))
+        (check "remote-addr comes from the actual peer endpoint"
+               "127.0.0.1" (:remote-addr m)))
       (let [resp (request p (get-request "/no-query"))
             m    (read-string (body-of resp))]
-        (check "nil query-string" nil (:query-string m))))))
+        (check "nil query-string" nil (:query-string m)))))
+  (with-server {:handler request-info-handler
+                :server-name "public.example"
+                :remote-addr "forwarded-client"}
+    (fn [p]
+      (let [m (read-string (body-of (request p (get-request "/override"))))]
+        (check "explicit server-name overrides the local endpoint"
+               "public.example" (:server-name m))
+        (check "explicit remote-addr overrides the peer endpoint"
+               "forwarded-client" (:remote-addr m))))))
 
 (defn- test-methods []
   (with-server request-info-handler
@@ -206,6 +251,73 @@
                                          (str/split-lines %))))
                     resp)))))
 
+(defn- test-response-metadata-fails-closed []
+  (with-server
+    {:error-logger (fn [_])
+     :handler
+     (fn [req]
+       (case (:uri req)
+         "/both" {:status 200
+                  :headers {"Content-Length" "5"
+                            "Transfer-Encoding" "chunked"}
+                  :body "HELLO"}
+         "/same-cl" {:status 200
+                     :headers {"Content-Length" "5"
+                               "content-length" "5"}
+                     :body "HELLO"}
+         "/different-cl" {:status 200
+                          :headers {"Content-Length" "5"
+                                    "content-length" "6"}
+                          :body "HELLO"}
+         "/huge-cl" {:status 200
+                     :headers {"Content-Length" "9223372036854775808"}
+                     :body "x"}
+         "/bad-te" {:status 200
+                    :headers {"Transfer-Encoding" "gzip"}
+                    :body "x"}
+         "/bad-status-text" {:status (str "200" (char 13) (char 10)
+                                          "X-Injected: yes")
+                             :headers {}
+                             :body "x"}
+         "/bad-status-low" {:status 99 :headers {} :body "x"}
+         "/bad-status-high" {:status 1000 :headers {} :body "x"}
+         "/bad-status-fraction" {:status 200.5 :headers {} :body "x"}
+         "/bad-status-false" {:status false :headers {} :body "x"}
+         "/bad-status-nil" {:status nil :headers {} :body "x"}
+         {:status 404 :headers {} :body "nf"}))}
+    (fn [p]
+      (let [resp   (request p (get-request "/both"))
+            parsed (model/read-response (model/->octets resp))]
+        (check "response Transfer-Encoding wins over Content-Length"
+               nil (header-of resp "Content-Length"))
+        (check "response Transfer-Encoding is canonical chunked"
+               "chunked" (header-of resp "Transfer-Encoding"))
+        (check "canonicalized response framing parses cleanly"
+               nil (:error parsed))
+        (check "canonicalized response keeps the body"
+               "HELLO" (model/body-str parsed)))
+      (let [resp (request p (get-request "/same-cl"))]
+        (check "identical response Content-Length values collapse"
+               "5" (header-of resp "Content-Length"))
+        (check "collapsed response Content-Length is emitted once"
+               1 (count (re-seq #"(?i)content-length:" resp))))
+      (doseq [[path label]
+              [["/different-cl" "conflicting response Content-Length"]
+               ["/huge-cl" "unrepresentable response Content-Length"]
+               ["/bad-te" "unsupported response Transfer-Encoding"]
+               ["/bad-status-text" "text response status"]
+               ["/bad-status-low" "response status below 100"]
+               ["/bad-status-high" "response status above 999"]
+               ["/bad-status-fraction" "fractional response status"]
+               ["/bad-status-false" "false response status"]
+               ["/bad-status-nil" "nil response status"]]]
+        (let [resp (request p (get-request path))]
+          (check (str label " -> 500") 500 (status-of resp))
+          (check (str label " emits one status line")
+                 1 (count (re-seq #"HTTP/1\.1 " resp)))
+          (check (str label " cannot inject a header")
+                 nil (header-of resp "X-Injected")))))))
+
 (defn- test-body-types []
   (with-server (fn [req]
                  (case (:uri req)
@@ -229,6 +341,25 @@
         (check-pred "seq body content"
                     #(str/includes? % "chunk1") (body-of resp)))
       (check "404 status" 404 (status-of (request p (get-request "/missing")))))))
+
+(defn- test-guarded-offset-streamable-body []
+  (let [prefix  "prefix-guard:"
+        payload "only-this-nonzero-offset-range-may-reach-the-wire"
+        suffix  ":suffix-guard"
+        data    (utf8 (str prefix payload suffix))
+        body    (->GuardedOffsetBody data
+                                     (alength (utf8 prefix))
+                                     (alength (utf8 payload)))]
+    (with-server (fn [_] {:status 200 :headers {} :body body})
+      (fn [p]
+        (let [resp   (request p (get-request "/"))
+              parsed (model/read-response (model/->octets resp))]
+          (check "offset StreamableBody uses chunked framing"
+                 "chunked" (header-of resp "Transfer-Encoding"))
+          (check "offset StreamableBody response parses cleanly"
+                 nil (:error parsed))
+          (check "StreamableBody/coalescing/chunked preserve only the guarded range"
+                 payload (model/body-str parsed)))))))
 
 (defn- test-file-body []
   (let [f (java.io.File. "test/jolt/http/test_file.txt")]
@@ -268,12 +399,27 @@
 
 (defn- test-large-response-body []
   (let [payload (str/join (repeat 20000 "0123456789"))]     ; 200_000 bytes
-    (with-server (fn [_] {:status 200 :headers {} :body payload})
+    (with-server (fn [req]
+                   {:status 200
+                    :headers {}
+                    :body (if (= "/seq" (:uri req))
+                            (vec (map #(apply str %)
+                                      (partition-all 997 payload)))
+                            payload)})
       (fn [p]
         (let [resp (request p (get-request "/"))]
           (check "200KB response length"
                  (str (count payload)) (header-of resp "Content-Length"))
-          (check "200KB response body intact" payload (body-of resp)))))))
+          (check "200KB response body intact" payload (body-of resp)))
+        (let [resp (request p (get-request "/seq"))]
+          (check "200KB sequential response is chunked"
+                 "chunked" (header-of resp "Transfer-Encoding"))
+          (let [{:keys [responses error trailing]}
+                (model/read-responses (model/->octets resp))]
+            (check "200KB sequential response parses cleanly"
+                   [nil []] [error trailing])
+            (check "200KB sequential response body intact"
+                   payload (model/body-str (first responses)))))))))
 
 (defn- test-keep-alive []
   (with-server hello-handler
@@ -733,6 +879,39 @@
       (check "half-close error answered" 400
              (status-of (half-close-request p "GET / HTTP/1.1\r\n\r\n"))))))
 
+(defn- test-incomplete-request-eof-is-terminal []
+  (with-server echo-handler
+    (fn [p]
+      (doseq [[label raw]
+              [["partial request line"
+                "GET / HTT"]
+               ["partial header field"
+                "GET / HTTP/1.1\r\nHost: h\r\nX-Part"]
+               ["missing end of header section"
+                "GET / HTTP/1.1\r\nHost: h\r\n"]
+               ["short fixed-length body"
+                (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                     "Content-Length: 5\r\nConnection: close\r\n\r\nabc")]
+               ["partial chunk-size line"
+                (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5")]
+               ["short chunk data"
+                (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                     "5\r\nabc")]
+               ["partial chunk data terminator"
+                (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                     "5\r\nhello\r")]
+               ["partial trailer section"
+                (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                     "0\r\nX-Trailer: v\r\n")]]]
+        (let [resp (half-close-request p raw)]
+          (check (str label " at EOF -> 400") 400 (status-of resp))
+          (check (str label " gets exactly one terminal response")
+                 1 (count (re-seq #"HTTP/1\.1 " resp))))))))
+
 (defn- test-expect-continue []
   (with-server (fn [req] {:status 200 :headers {}
                           :body (str "got:" (body/body-string (:body req) "UTF-8"))})
@@ -795,6 +974,49 @@
                                         "X-Big: " (str/join (repeat 2000 "y"))
                                         "\r\n\r\n")))))))
 
+(defn- test-aggregate-header-limits []
+  ;; The section-byte limit counts every field's CRLF and the final blank CRLF.
+  ;; "Host: h\r\nX: 12345\r\n\r\n" is therefore exactly 21 octets.
+  (with-server {:handler hello-handler :max-header-bytes 21 :max-header-count 10}
+    (fn [p]
+      (check "aggregate header bytes accept the exact boundary"
+             200
+             (status-of
+              (request p "GET / HTTP/1.1\r\nHost: h\r\nX: 12345\r\n\r\n" true)))))
+  (with-server {:handler hello-handler :max-header-bytes 20 :max-header-count 10}
+    (fn [p]
+      (check "aggregate header bytes reject boundary plus one"
+             431
+             (status-of
+              (request p "GET / HTTP/1.1\r\nHost: h\r\nX: 12345\r\n\r\n" true)))))
+  (with-server {:handler hello-handler :max-header-bytes 1024 :max-header-count 2}
+    (fn [p]
+      (check "aggregate header count accepts the exact boundary"
+             200
+             (status-of
+              (request p "GET / HTTP/1.1\r\nHost: h\r\nX: v\r\n\r\n" true)))
+      (check "aggregate header count rejects boundary plus one"
+             431
+             (status-of
+              (request p
+                       "GET / HTTP/1.1\r\nHost: h\r\nX: v\r\nY: v\r\n\r\n"
+                       true))))))
+
+(defn- test-content-length-overflow []
+  (let [invoked (atom 0)]
+    (with-server
+      (fn [_]
+        (swap! invoked inc)
+        {:status 200 :headers {} :body "unexpected"})
+      (fn [p]
+        (let [resp (request p
+                            (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                                 "Content-Length: 9223372036854775808\r\n"
+                                 "Connection: close\r\n\r\n"))]
+          (check "Content-Length above signed long -> 400" 400 (status-of resp))
+          (check "overflowing Content-Length never reaches the handler"
+                 0 @invoked))))))
+
 (defn- test-exception-handling []
   (with-server {:handler (fn [_] (throw (ex-info "boom" {})))
                 :error-logger (fn [_])}
@@ -838,6 +1060,39 @@
         (check "async status" 200 (status-of resp))
         (check "async body" "async!" (body-of resp))))))
 
+(defn- test-async-streamable-bodies-finalize []
+  (let [custom-open (->GuardedOffsetBody
+                     (utf8 "prefix-custom-open-suffix")
+                     (alength (utf8 "prefix-"))
+                     (alength (utf8 "custom-open")))]
+  (with-server
+    {:async? true
+     :handler
+     (fn [req respond _raise]
+       (future
+         (respond
+          {:status 200
+           :headers {}
+           :body (case (:uri req)
+                   "/seq" ["abc" "def"]
+                   "/custom-open" custom-open
+                   "/custom-close" (->SelfClosingBody (utf8 "custom-close"))
+                   ["missing"])})))}
+    (fn [p]
+      (doseq [[path expected] [["/seq" "abcdef"]
+                               ["/custom-open" "custom-open"]
+                               ["/custom-close" "custom-close"]]]
+        (let [wire   (request p (get-request path))
+              {:keys [responses error trailing]}
+              (model/read-responses (model/->octets wire))
+              parsed (first responses)]
+          (check (str "async " path " response is fully terminated")
+                 [nil [] 1] [error trailing (count responses)])
+          (check (str "async " path " response body is intact")
+                 expected (model/body-str parsed))
+          (check (str "async " path " emits exactly one status line")
+                 1 (count (re-seq #"HTTP/1\.1 " wire)))))))))
+
 (defn- test-async-raise []
   (with-server {:async? true
                 :error-logger (fn [_])
@@ -866,6 +1121,163 @@
         (doseq [f fs] (deref f))
         (check (str n " concurrent requests all 200")
                (repeat n 200) (seq @results))))))
+
+(defn- test-pool-size-concurrent-sequential-responses []
+  ;; Every handler in the bounded pool reaches the generic sequential-body path
+  ;; together. Each then blocks on socket write completion; only TCP's separate
+  ;; callback executor can release them.
+  (let [pool-size 3
+        started   (atom 0)
+        release   (promise)
+        part      (apply str (repeat 997 "x"))
+        parts     (vec (repeat 201 part))
+        payload   (apply str parts)
+        handler   (fn [_]
+                    (when (= pool-size (swap! started inc))
+                      (deliver release true))
+                    (deref release 3000 :timeout)
+                    {:status 200 :headers {} :body parts})]
+    (with-server {:handler handler :pool-size pool-size}
+      (fn [p]
+        (let [calls   (mapv (fn [_]
+                              (future (request p (get-request "/seq"))))
+                            (range pool-size))
+              results (mapv #(deref % 15000 :timeout) calls)]
+          (check "exactly pool-size sequential handlers overlap"
+                 pool-size @started)
+          (check "pool-size sequential responses all complete"
+                 false (boolean (some #(= :timeout %) results)))
+          (check "pool-size 200KB sequential responses stay byte-exact"
+                 (vec (repeat pool-size payload))
+                 (mapv (fn [resp]
+                         (when (string? resp)
+                           (model/body-str
+                            (model/read-response (model/->octets resp)))))
+                       results)))))))
+
+(defn- test-executor-ownership-and-idempotent-stop []
+  (let [srv   (http/run-server hello-handler :port 0 :reuse-address? true)
+        owned (get-in srv [:srv :executor])]
+    (try
+      (check "HTTP-created executor starts live" false (.isShutdown owned))
+      (check "first stop succeeds" nil (http/stop-server srv))
+      (check "HTTP-created executor is adopted and shut down"
+             true (.isShutdown owned))
+      (check "stop is idempotent after complete cleanup"
+             nil (http/stop-server srv))
+      (finally
+        (when @(:running? srv) (http/stop-server srv))
+        (when-not (.isShutdown owned) (.shutdown owned)))))
+  (let [borrowed (java.util.concurrent.Executors/newFixedThreadPool 2)
+        srv      (http/run-server hello-handler :port 0 :reuse-address? true
+                                  :executor borrowed)]
+    (try
+      (http/stop-server srv)
+      (check "supplied executor remains borrowed by default"
+             false (.isShutdown borrowed))
+      (finally
+        (when @(:running? srv) (http/stop-server srv))
+        (.shutdown borrowed))))
+  (let [adopted (java.util.concurrent.Executors/newFixedThreadPool 2)
+        srv     (http/run-server hello-handler :port 0 :reuse-address? true
+                                 :executor adopted :shutdown-executor? true)]
+    (try
+      (http/stop-server srv)
+      (check "supplied executor can be explicitly adopted"
+             true (.isShutdown adopted))
+      (finally
+        (when @(:running? srv) (http/stop-server srv))
+        (when-not (.isShutdown adopted) (.shutdown adopted))))))
+
+(defn- test-stop-unblocks-incomplete-streaming-body []
+  (let [first-chunk (promise)
+        finished    (promise)
+        handler     (fn [req _respond _raise]
+                      (let [request-body (:body req)
+                            first        (body/body-recv request-body)]
+                        (deliver first-chunk (->str first))
+                        ;; This second receive is deliberately blocked until
+                        ;; TCP invokes the connection close arity and HTTP closes
+                        ;; the request-body channel.
+                        (deliver finished
+                                 (nil? (body/body-recv request-body)))))
+        srv         (http/run-server handler :async? true :port 0
+                                     :reuse-address? true
+                                     :stop-timeout-ms 3000)
+        client      (net/connect-loopback (:port srv))]
+    (try
+      (net/client-send-all
+       client
+       (utf8 (str "POST / HTTP/1.1\r\nHost: localhost\r\n"
+                  "Content-Length: 100\r\n\r\nabc")))
+      (check "streaming handler receives the available prefix"
+             "abc" (deref first-chunk 2000 :timeout))
+      (let [stopping (future (http/stop-server srv))]
+        (check "stop completes with an incomplete streaming request"
+               nil (deref stopping 5000 :timeout))
+        (check "stop closes the request-body channel and unblocks its handler"
+               true (deref finished 1000 false)))
+      (finally
+        (net/close! client)
+        (when @(:running? srv) (http/stop-server srv))))))
+
+(defn- test-peer-reset-unblocks-streaming-response []
+  ;; Deterministically inject the transport outcome a real reset produces, but
+  ;; only after the client request is fully sent and the async handler is parked
+  ;; at a gate. This avoids timing a kernel RST while still exercising the whole
+  ;; jolt-http -> jolt-tcp failure path.
+  (let [native-write jnet/try-write-bytes!
+        fail?        (atom false)
+        started      (promise)
+        release      (promise)
+        observed     (promise)
+        reset-ex     (ex-info "synthetic peer reset"
+                              {:jolt.net/kind :connection-reset})
+        chunk        (byte-array 65536)
+        handler      (fn [_req respond _raise]
+                       (deliver started true)
+                       @release
+                       (try
+                         (respond {:status 200 :headers {} :body [chunk chunk]})
+                         (deliver observed :returned)
+                         (catch :default e
+                           (deliver observed e))))]
+    (with-redefs
+      [jnet/try-write-bytes!
+       (fn [socket bs off len]
+         (if @fail?
+           (throw reset-ex)
+           (native-write socket bs off len)))]
+      (let [srv    (http/run-server handler :async? true :port 0
+                                    :reuse-address? true
+                                    :error-logger (fn [_])
+                                    :stop-timeout-ms 3000)
+            client (net/connect-loopback (:port srv))]
+        (try
+          (net/client-send-all client (utf8 (get-request "/reset")))
+          (check "peer-reset handler reached its deterministic gate"
+                 true (deref started 2000 false))
+          (reset! fail? true)
+          (deliver release true)
+          (let [outcome (deref observed 3000 :timeout)]
+            (check "peer reset unblocks the async response task"
+                   false (= :timeout outcome))
+            (check-pred
+             "peer reset is surfaced directly or as the closed-socket cause"
+             (fn [[kind cause-kind]]
+               (or (= :connection-reset kind)
+                   (and (= :teensyp.server/socket-closed kind)
+                        (= :connection-reset cause-kind))))
+             (when (and (not= :timeout outcome)
+                        (not= :returned outcome))
+               [(or (:jolt.net/kind (ex-data outcome))
+                    (:err (ex-data outcome)))
+                (some-> outcome ex-cause ex-data :jolt.net/kind)])))
+          (check "server quiesces after a response write failure"
+                 nil (http/stop-server srv))
+          (finally
+            (net/close! client)
+            (when @(:running? srv) (http/stop-server srv))))))))
 
 (defn- test-date-header-format []
   (with-server hello-handler
@@ -923,7 +1335,9 @@
    ["request methods"      test-methods]
    ["request headers"      test-headers]
    ["response headers"     test-response-headers]
+   ["response metadata"    test-response-metadata-fails-closed]
    ["body types"           test-body-types]
+   ["offset streamable body" test-guarded-offset-streamable-body]
    ["file body"            test-file-body]
    ["request body"         test-request-body]
    ["large request body"   test-large-request-body]
@@ -942,6 +1356,7 @@
    ["header injection"     test-response-header-injection]
    ["parser vectors"       test-parser-vectors]
    ["half-close"           test-half-close]
+   ["incomplete request EOF" test-incomplete-request-eof-is-terminal]
    ["expect 100-continue"  test-expect-continue]
    ["invalid host value"   test-invalid-host-value]
    ["chunk terminator"     test-chunk-terminator]
@@ -951,13 +1366,21 @@
    ["smuggling: request-line"      test-smuggling-request-line]
    ["smuggling: pipelining"        test-smuggling-pipelining]
    ["oversized request"    test-oversized]
+   ["aggregate header limits" test-aggregate-header-limits]
+   ["Content-Length overflow" test-content-length-overflow]
    ["exception handling"   test-exception-handling]
    ["exception cleanup"    test-close-after-spent-parser-state]
    ["custom error handler" test-custom-error-handler]
    ["async handler"        test-async-handler]
+   ["async streamable bodies" test-async-streamable-bodies-finalize]
    ["async raise"          test-async-raise]
    ["date header format"   test-date-header-format]
    ["concurrency"          test-concurrency]
+   ["pool-size sequential responses"
+    test-pool-size-concurrent-sequential-responses]
+   ["executor ownership"   test-executor-ownership-and-idempotent-stop]
+   ["stop streaming body"  test-stop-unblocks-incomplete-streaming-body]
+   ["peer reset response"  test-peer-reset-unblocks-streaming-response]
 
    ;; Generative layers (jolt-hegel). The pure and in-process properties run
    ;; under clojure.test via hegel.clojure-test/with; the loopback properties

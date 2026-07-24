@@ -42,14 +42,16 @@
   [conn]
   (transient (assoc (:base-request conn)
                     ::step :start-line
-                    ::conn conn)))
+                    ::conn conn
+                    ::header-bytes 0
+                    ::header-count 0)))
 
 (defn- ->ring-request
   "Persist the parser state into the map handed to the Ring handler, dropping
   the parser's own bookkeeping keys."
   [state]
   (-> (persistent! state)
-      (dissoc ::step ::conn)))
+      (dissoc ::step ::conn ::header-bytes ::header-count)))
 
 ;; Each clause binds an index and continues only if it is a usable one. Note the
 ;; nil check: Capra used `.indexOf`, which reports "absent" as -1, but these use
@@ -172,8 +174,10 @@
       ;; be true while an older invocation is still working against a view taken
       ;; before EOF, and closing on it preempts decisions this invocation was
       ;; about to make correctly — including the oversize one above.
-      (and (tcp/peer-eof-notified? socket) (not (buf/has-remaining? buffer)))
-      (do (tcp/close socket) {::step :done})
+      (tcp/peer-eof-notified? socket)
+      (if-not (buf/has-remaining? buffer)
+        (do (tcp/close socket) {::step :done})
+        {::step :error, ::error :incomplete-request})
 
       :else nil)))
 
@@ -226,14 +230,40 @@
                         (assoc-request-header! headers (str/lower-case raw-name) value))))
             (bad-header :invalid-request-header line))))
 
-(defn- read-header [{:keys [headers] :as state} buffer max-buffer-size]
+(defn- read-header
+  [{:keys [headers] ::keys [header-bytes header-count] :as state}
+   socket buffer max-buffer-size max-header-bytes max-header-count]
   (if-some [line (buf/read-line-strict buffer "US-ASCII")]
+    ;; The strict line reader's bare-LF sentinel is a keyword, not text. Reject
+    ;; it before measuring the line so malformed framing cannot reach `count`.
+    (if (= line bare-lf)
+      {::step :error, ::error :bare-lf}
+      (let [bytes' (+ (long header-bytes) (count line) 2)
+            count' (+ (long header-count) (if (= line "") 0 1))]
+        (cond
+          (> bytes' (long max-header-bytes))
+          {::step :error, ::error :request-headers-too-large}
+
+          (> count' (long max-header-count))
+          {::step :error, ::error :too-many-request-headers}
+
+          (= line "")
+          (assoc! state ::step :handler
+                  ::header-bytes bytes'
+                  :headers (persistent! headers))
+
+          :else
+          (parse-header
+           (assoc! state ::header-bytes bytes' ::header-count count')
+           line))))
     (cond
-      (= line bare-lf) {::step :error, ::error :bare-lf}
-      (= line "")      (assoc! state ::step :handler, :headers (persistent! headers))
-      :else            (parse-header state line))
-    (when-not (< (buf/limit buffer) (long max-buffer-size))
-      {::step :error, ::error :request-header-field-too-large})))
+      (not (< (buf/limit buffer) (long max-buffer-size)))
+      {::step :error, ::error :request-header-field-too-large}
+
+      (tcp/peer-eof-notified? socket)
+      {::step :error, ::error :incomplete-request}
+
+      :else nil)))
 
 ;; --- response writing ------------------------------------------------------
 
@@ -271,7 +301,7 @@
 (defn- write-via-sink
   "The generic path: length is unknown, so the head is flushed first and the
   body is streamed through a blocking Sink."
-  [b response headers buffer socket async? callback]
+  [b response headers buffer socket _async? callback]
   (when (and (nil? (headers "transfer-encoding"))
              (nil? (headers "content-length")))
     (body/put! buffer chunked-header))
@@ -282,10 +312,17 @@
   (let [sink (body/socket-sink socket (fn [_sock] (callback)))
         sink (if (body/chunked-response? headers)
                (body/chunked-sink sink)
-               (body/limited-sink sink (body/content-length headers) socket))]
+               (body/limited-sink sink (body/content-length headers) socket))
+        ;; Preserve the generic Sink contract while preventing a seqable body
+        ;; from paying one reactor completion round trip per element.
+        sink (body/coalescing-sink sink (buf/capacity buffer))]
     (try (body/write-body-to-sink b response sink)
          (finally
-           (when-not async? (body/sink-close! sink))))))
+           ;; StreamableBody is synchronous at this boundary. Handler async-ness
+           ;; controls when `respond` is called, not whether a completed body
+           ;; leaves its framing open. The Sink chain is idempotent, so a custom
+           ;; body may close early without producing a second terminator.
+           (body/sink-close! sink)))))
 
 (extend (Class/forName "[B")
   SocketBody
@@ -440,6 +477,53 @@
                    (some unsafe-field-value? values))]
      [k v])))
 
+(defn- response-header-values
+  "Every wire value supplied for the case-insensitive response field `name`."
+  [headers name]
+  (mapcat (fn [[k v]]
+            (when (= name (str/lower-case (str k)))
+              (if (vector? v) v [v])))
+          headers))
+
+(defn- remove-response-header [headers name]
+  (reduce-kv (fn [m k v]
+               (if (= name (str/lower-case (str k)))
+                 m
+                 (assoc m k v)))
+             {} headers))
+
+(defn- comma-parts [values]
+  (mapcat #(map str/trim (str/split (str %) #",")) values))
+
+(defn- content-length-state [headers]
+  (let [values (response-header-values headers "content-length")]
+    (if (empty? values)
+      {:kind :none}
+      (let [parts (distinct (comma-parts values))]
+        (if (not= 1 (count parts))
+          {:kind :invalid, :values (vec values)}
+          (if-some [n (body/parse-content-length (first parts))]
+            {:kind :valid, :value (str n)}
+            {:kind :invalid, :values (vec values)}))))))
+
+(defn- transfer-encoding-state [headers]
+  (let [values (response-header-values headers "transfer-encoding")]
+    (if (empty? values)
+      {:kind :none}
+      (let [parts (comma-parts values)]
+        (if (and (= 1 (count parts))
+                 (= "chunked" (str/lower-case (first parts))))
+          {:kind :chunked}
+          {:kind :invalid, :values (vec values)})))))
+
+(defn- valid-status? [status]
+  (and (integer? status) (<= 100 status 999)))
+
+(def ^:private internal-error-response
+  {:status  500
+   :headers {"Content-Type" "text/plain; charset=UTF-8"}
+   :body    "Internal Server Error"})
+
 (def ^:private no-content-length-statuses
   "RFC 9112 6.2 — a Content-Length must never be sent on these."
   #{204})
@@ -468,18 +552,49 @@
 ;; --- Ring handler plumbing -------------------------------------------------
 
 (defn- sanitize-response
-  "Replace a response whose headers cannot be safely serialised with a 500.
+  "Validate and canonicalize a response before the first byte is written.
 
-  A field name that is not a token, or a value containing CR/LF/NUL, would
-  split the response — so the handler's output is dropped rather than emitted.
-  Returns [response offenders]."
+  Invalid status/header syntax and unrepresentable framing fail closed to a 500.
+  A valid `Transfer-Encoding: chunked` wins over Content-Length, whose field is
+  removed before serialization as RFC 9112 requires. Repeated identical decimal
+  Content-Length values are collapsed to one canonical field.
+
+  Returns [safe-response problems]."
   [response]
-  (if-some [offenders (invalid-response-headers (:headers response))]
-    [{:status  500
-      :headers {"Content-Type" "text/plain; charset=UTF-8"}
-      :body    "Internal Server Error"}
-     offenders]
-    [response nil]))
+  (let [response (or response {})
+        ;; Preserve the historical default only when the key is absent. An
+        ;; explicitly supplied nil/false status is metadata, and must fail the
+        ;; same three-digit-integer check as any other invalid value.
+        status   (if (contains? response :status) (:status response) 200)
+        headers  (into {} (or (:headers response) {}))
+        unsafe   (invalid-response-headers headers)
+        cl       (content-length-state headers)
+        te       (transfer-encoding-state headers)
+        problems (cond-> []
+                   (not (valid-status? status))
+                   (conj {:kind :invalid-status, :value status})
+                   unsafe
+                   (conj {:kind :unsafe-header, :headers (vec unsafe)})
+                   (= :invalid (:kind cl))
+                   (conj {:kind :invalid-content-length, :values (:values cl)})
+                   (= :invalid (:kind te))
+                   (conj {:kind :invalid-transfer-encoding, :values (:values te)}))]
+    (if (seq problems)
+      [internal-error-response problems]
+      (let [headers (-> headers
+                        (remove-response-header "content-length")
+                        (remove-response-header "transfer-encoding"))
+            ;; Transfer-Encoding determines response framing and therefore
+            ;; suppresses Content-Length when both were supplied.
+            headers (cond
+                      (= :chunked (:kind te))
+                      (assoc headers "Transfer-Encoding" "chunked")
+
+                      (= :valid (:kind cl))
+                      (assoc headers "Content-Length" (:value cl))
+
+                      :else headers)]
+        [(assoc response :status status :headers headers) nil]))))
 
 (defn- strip-framing-headers
   "Drop any Content-Length/Transfer-Encoding a handler supplied, for statuses
@@ -502,13 +617,13 @@
   ([request socket handled done buffer read-buffer error-logger handler-returned?]
    (fn respond [response async?]
      (when (compare-and-set! handled false true)
-       (let [[response offenders] (sanitize-response response)
-             _          (when (and offenders error-logger)
+       (let [[response problems] (sanitize-response response)
+             _          (when (and problems error-logger)
                           (error-logger
-                           (ex-info "Response header contains CR, LF or NUL; refusing to send it"
-                                    {:err     ::unsafe-response-header
-                                     :headers (vec offenders)})))
-             status     (or (:status response) 200)
+                           (ex-info "Invalid HTTP response; refusing to serialize it"
+                                    {:err      ::invalid-response
+                                     :problems (vec problems)})))
+             status     (:status response)
              suppress?  (suppress-framing? status)
              response   (cond-> response
                           suppress? (update :headers strip-framing-headers))
@@ -701,15 +816,16 @@
        (contains? headers "transfer-encoding")))
 
 (defn- invalid-content-length?
-  "A Content-Length that is not a single non-negative integer. Repeated
+  "A Content-Length that is not a single representable non-negative integer. Repeated
   Content-Length fields arrive here joined with commas (\"5,6\"); identical
   values collapse to one, differing values are a smuggling vector and must be
-  rejected rather than silently mis-parsed."
+  rejected rather than silently mis-parsed. Values larger than the signed
+  64-bit remaining-byte counter are rejected before the handler is invoked."
   [{:keys [headers]}]
   (when-some [v (headers "content-length")]
     (let [parts (distinct (map str/trim (str/split v #",")))]
       (or (not= 1 (count parts))
-          (nil? (re-matches #"\d+" (first parts)))))))
+          (nil? (body/parse-content-length (first parts)))))))
 
 (defn- normalize-content-length
   "Collapse a repeated-but-identical Content-Length (\"5,5\") to a single value,
@@ -717,7 +833,8 @@
   [request]
   (if-some [v (get-in request [:headers "content-length"])]
     (assoc-in request [:headers "content-length"]
-              (str/trim (first (str/split v #","))))
+              (str (body/parse-content-length
+                    (str/trim (first (str/split v #","))))))
     request))
 
 (defn- run-ring-handler [ring-handler state socket read-buffer opts]
@@ -807,21 +924,28 @@
       ;; Trailer section is incomplete; wait for more bytes.
       nil)))
 
-(defn- invalid-chunk
-  "Fail a request whose chunked framing is malformed.
+(defn- body-error
+  "Fail a request whose body framing is malformed or terminally incomplete.
 
-  Claims the response slot *before* unblocking the handler, so the answer to a
-  malformed body is deterministically the 400 and not whatever the handler made
-  of a truncated body. Closing the channel first would race: the handler wakes,
-  responds 200, and wins."
-  [{::keys [chan handled]} socket]
+  Atomically claims the response slot *before* unblocking a waiting handler. If
+  the claim succeeds, the framing error owns the one 400 response; closing the
+  channel first would let the handler wake and win that race. If the handler
+  already claimed the slot intentionally, close behind its response without
+  appending a second one."
+  [{::keys [chan handled]} socket error]
   (let [claimed? (or (nil? handled) (compare-and-set! handled false true))]
     (when chan (a/close! chan))
     (if claimed?
-      {::step :error, ::error :invalid-chunk-size}
+      {::step :error, ::error error}
       ;; The handler already replied; the framing is broken either way, so the
       ;; connection cannot be reused.
       (do (tcp/close socket) {::step :done}))))
+
+(defn- invalid-chunk [state socket]
+  (body-error state socket :invalid-chunk-size))
+
+(defn- incomplete-body [state socket]
+  (body-error state socket :incomplete-request))
 
 (defn- read-chunk-head
   "Parse the chunk-size line at the buffer's position **without consuming it**.
@@ -873,25 +997,29 @@
     ;; without checking silently accepts a mis-sized chunk, which is exactly how
     ;; a desync is smuggled through.
     chunk-crlf?
-    (when (>= (buf/remaining buffer) 2)
+    (if (>= (buf/remaining buffer) 2)
       (let [pos (buf/position buffer)]
         (if-not (and (= 13 (bit-and (buf/get-byte buffer pos) 0xff))
                      (= 10 (bit-and (buf/get-byte buffer (inc pos)) 0xff)))
           (invalid-chunk state socket)
           (do (buf/set-position! buffer (+ pos 2))
-              (assoc! state ::chunk-crlf? false)))))
+              (assoc! state ::chunk-crlf? false))))
+      (when (tcp/peer-eof-notified? socket)
+        (incomplete-body state socket)))
 
     ;; Mid-chunk: hand the handler whatever has arrived, however little.
     (and chunk-left (pos? (long chunk-left)))
-    (when (buf/has-remaining? buffer)
+    (if (buf/has-remaining? buffer)
       (let [n  (min (long chunk-left) (buf/remaining buffer))
             bs (buf/get-bytes! buffer n)
             left (- (long chunk-left) n)]
         (push-chunk! chan bs)
-        (assoc! state ::chunk-left left ::chunk-crlf? (zero? left))))
+        (assoc! state ::chunk-left left ::chunk-crlf? (zero? left)))
+      (when (tcp/peer-eof-notified? socket)
+        (incomplete-body state socket)))
 
     :else
-    (when-some [r (read-chunk-head buffer)]
+    (if-some [r (read-chunk-head buffer)]
       (if (= r ::invalid)
         (invalid-chunk state socket)
         (let [[length after] r]
@@ -908,25 +1036,31 @@
                 (cond
                   (= t ::end)     (end-of-body state)
                   (= t ::invalid) (invalid-chunk state socket)
-                  :else           nil)))
+                  (tcp/peer-eof-notified? socket)
+                  (incomplete-body state socket)
+                  :else nil)))
             (do (buf/set-position! buffer after)
-                (assoc! state ::chunk-left length ::chunk-crlf? false))))))))
+                (assoc! state ::chunk-left length ::chunk-crlf? false)))))
+      (when (tcp/peer-eof-notified? socket)
+        (incomplete-body state socket)))))
 
-(defn- read-known-length-body [{::keys [chan length] :as state} buffer]
+(defn- read-known-length-body [{::keys [chan length] :as state} socket buffer]
   (let [length (long length)]
     (if (pos? length)
-      (when (buf/has-remaining? buffer)
+      (if (buf/has-remaining? buffer)
         (let [n  (min length (buf/remaining buffer))
               bs (buf/get-bytes! buffer n)]
           (push-chunk! chan bs)
           ;; assoc! — `state` is transient here, and plain `assoc` on a
           ;; transient throws a ClassCastException on jolt.
-          (assoc! state ::length (- length n))))
+          (assoc! state ::length (- length n)))
+        (when (tcp/peer-eof-notified? socket)
+          (incomplete-body state socket)))
       (end-of-body state))))
 
 (defn- read-body [{::keys [length chunked?] :as state} socket buffer]
   (cond
-    length   (read-known-length-body state buffer)
+    length   (read-known-length-body state socket buffer)
     chunked? (read-chunked-body state socket buffer)
     :else    (end-of-body state)))
 
@@ -968,17 +1102,27 @@
 
 (defn tcp-handler
   "Create a jolt-tcp (teensyp) handler from a Ring handler."
-  [handler {:keys [error-logger response-buffer-size port server-name remote-addr]
+  [handler {:keys [error-logger response-buffer-size port server-name remote-addr
+                   max-header-bytes max-header-count]
             max-buf-size :read-buffer-size
             :as opts}]
   (fn
     ([socket]
-     (init-request
-      {:response-buffer (buf/buffer response-buffer-size)
-       :base-request    {:scheme      :http
-                         :server-port port
-                         :server-name server-name
-                         :remote-addr remote-addr}}))
+     (let [{local  :local-address
+            remote :remote-address} (tcp/socket-info socket)]
+       (init-request
+        {:response-buffer (buf/buffer response-buffer-size)
+         :base-request    {:scheme      :http
+                           ;; getsockname is authoritative for an ephemeral
+                           ;; bind. The configured value remains the fallback
+                           ;; for in-process Socket fakes and older adapters.
+                           :server-port (or (:port local) port)
+                           :server-name (or server-name
+                                            (:host local)
+                                            "127.0.0.1")
+                           :remote-addr (or remote-addr
+                                            (:host remote)
+                                            "127.0.0.1")}})))
     ([state socket buffer]
      ;; Captured once, before stepping: an error step yields a plain map that
      ;; carries no ::conn, and reading it back off a spent transient would fail.
@@ -988,7 +1132,8 @@
          (if-some [new-state
                    (case (::step state)
                      :start-line (read-start-line state socket buffer max-buf-size)
-                     :headers    (read-header state buffer max-buf-size)
+                     :headers    (read-header state socket buffer max-buf-size
+                                              max-header-bytes max-header-count)
                      :handler    (run-ring-handler handler state socket buffer opts)
                      :body       (read-body state socket buffer)
                      :buffer     (buffer-reads state socket buffer)

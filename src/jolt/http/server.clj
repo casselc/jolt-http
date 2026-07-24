@@ -41,9 +41,9 @@
   {:error-handler        default-error-handler
    :error-logger         default-error-logger
    :port                 80
-   :server-name          "127.0.0.1"
-   :remote-addr          "127.0.0.1"
    :read-buffer-size     8192
+   :max-header-bytes     65536
+   :max-header-count     100
    :response-buffer-size 32768
    ;; 4x the response buffer: jolt-tcp rejects a queued write that exceeds the
    ;; remaining write credit, and a full response buffer is queued at once.
@@ -68,25 +68,33 @@
     uncaught exceptions (defaults to sending a 500 Internal Server Error)
   - `:error-logger` - a function that takes a single exception argument and
     logs it somehow (defaults to printing to *err*)
-  - `:executor` - the ExecutorService to use for running handlers
+  - `:executor` - the ExecutorService to use for running handlers; supplied
+    executors are borrowed unless `:shutdown-executor?` is true
   - `:pool-size` - size of the default executor (defaults to 32)
   - `:port` - the port number to listen on (defaults to 80)
   - `:read-buffer-size` - the size of the buffer to use when reading from the
-    socket, which bounds the request line and header size (defaults to 8K)
+    socket, which bounds one request line or header field (defaults to 8K)
+  - `:max-header-bytes` - maximum aggregate request header-section bytes,
+    including CRLF delimiters (defaults to 64K)
+  - `:max-header-count` - maximum request header field count (defaults to 100)
   - `:recv-buffer-size` - the receive buffer size (i.e. the SO_RCVBUF option)
-  - `:remote-addr` - reported as `:remote-addr` on requests; jolt-tcp exposes no
-    peer address, so this is a constant (defaults to 127.0.0.1)
+  - `:remote-addr` - optional override for the connected peer address reported
+    on requests (defaults to jolt-tcp's actual peer endpoint)
   - `:response-buffer-size` - the size of the buffer used when constructing the
     response, which must be at least large enough to contain the response
     status line and headers (defaults to 32K)
   - `:reuse-address?` - sets the SO_REUSEADDR socket option (default false)
-  - `:server-name` - reported as `:server-name` on requests (default 127.0.0.1)
+  - `:server-name` - optional override for the local address reported on
+    requests (defaults to jolt-tcp's actual local endpoint)
+  - `:shutdown-executor?` - adopt and shut down a supplied `:executor` (default
+    false; an executor created by jolt-http is always adopted)
   - `:stream-queue-size` - how many request body chunks may be buffered before
     the reader applies backpressure (defaults to 8)
   - `:write-buffer-size` - the write buffer size in bytes (default 128K)
   - `:write-queue-size` - the max number of writes in the queue (default 64)"
-  [handler & {:as options}]
-  (let [options  (merge default-options options)
+  [handler & {:as supplied-options}]
+  (let [owns-executor? (nil? (:executor supplied-options))
+        options  (merge default-options supplied-options)
         ;; A configurable bounded pool. Capra uses a virtual-thread-per-task
         ;; executor, but jolt has no M:N virtual threads. In v0.4.15 the
         ;; cached, virtual-thread, and work-stealing constructor shims all map to
@@ -103,7 +111,11 @@
         executor (or (:executor options)
                      (java.util.concurrent.Executors/newFixedThreadPool
                       (:pool-size options)))
-        options  (assoc options :executor executor)
+        ;; TCP cannot infer that an executor passed by this adapter is owned by
+        ;; the adapter. Transfer ownership explicitly for the pool we create,
+        ;; while preserving TCP's borrowed-by-default rule for a user pool.
+        options  (cond-> (assoc options :executor executor)
+                   owns-executor? (assoc :shutdown-executor? true))
         handler  (if (:async? options)
                    (async-handler handler)
                    (sync-handler handler))]

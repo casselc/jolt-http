@@ -153,6 +153,38 @@
         (is (or (nil? (body/content-charset {"content-type" ct}))
                 (string? (body/content-charset {"content-type" ct}))))))
 
+;; --- Content-Length --------------------------------------------------------
+
+(deftest content-length-is-bounded-by-the-parser-counter
+  (with (assoc opts :name "body/content-length-boundary")
+        [delta (g/integer -16 16)]
+        (let [n      (+ body/max-content-length delta)
+              parsed (body/parse-content-length (str n))]
+          (h/fprn :minimal-delta delta :value (str n))
+          (if (pos? delta)
+            (is (nil? parsed)
+                "a decimal larger than signed long is rejected before body parsing")
+            (is (= (long n) parsed)
+                "every representable decimal at the upper boundary is accepted")))))
+
+(deftest content-length-parser-is-total-over-decimal-input
+  (with (assoc opts :name "body/content-length-total")
+        [digits (g/string {:min-size 1 :max-size 40
+                           :alphabet "0123456789"})]
+        (let [result (body/parse-content-length digits)]
+          (h/fprn :minimal-digits digits)
+          (is (or (nil? result)
+                  (and (integer? result)
+                       (<= 0 result body/max-content-length)))))))
+
+(deftest content-length-range-check-does-not-need-a-wide-integer
+  (let [zero-padded (str (apply str (repeat 8192 "0")) "1")
+        over-wide   (apply str (repeat 8192 "9"))]
+    (is (= 1 (body/parse-content-length zero-padded))
+        "arbitrarily many leading zeroes retain the represented value")
+    (is (nil? (body/parse-content-length over-wide))
+        "an over-wide decimal is rejected from its text width before parsing")))
+
 ;; --- writer functions ------------------------------------------------------
 
 (defn- drive-writer
@@ -271,6 +303,93 @@
       (swap! log into (subvec (m/->octets bs) off (+ (long off) (long len)))))
     (sink-close! [_] (swap! log identity))))
 
+(deftest coalescing-sink-bounds-sequential-write-handoffs
+  (let [payload (vec (range 201))
+        chunks  (mapv (fn [n]
+                        (byte-array (repeat 997 (unchecked-byte n))))
+                      payload)
+        octets  (atom [])
+        calls   (atom 0)
+        target  (reify body/Sink
+                  (sink-write! [_ bs off len]
+                    (swap! calls inc)
+                    (swap! octets into
+                           (subvec (m/->octets bs)
+                                   (long off)
+                                   (+ (long off) (long len)))))
+                  (sink-close! [_]))
+        sink    (body/coalescing-sink target 8192)]
+    (doseq [chunk chunks]
+      (body/sink-write! sink chunk 0 (alength chunk)))
+    (body/sink-close! sink)
+    (is (= (vec (mapcat m/->octets chunks)) @octets)
+        "coalescing preserves every byte in order")
+    (is (= 25 @calls)
+        "201 element writes become ceil(201*997/8192) downstream writes")))
+
+(deftest coalescing-sink-flushes-before-framing-close
+  (let [wire   (atom [])
+        target (recording-sink wire)
+        sink   (body/coalescing-sink (body/chunked-sink target) 16)
+        data   (m/->ba [1 2 3 4 5])]
+    (body/sink-write! sink data 0 (alength data))
+    (body/sink-close! sink)
+    (let [resp (m/read-response
+                (into (m/ascii
+                       "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                      @wire))]
+      (is (nil? (:error resp)))
+      (is (= [1 2 3 4 5] (:body resp))))))
+
+(deftest sink-chain-finalization-is-observably-exactly-once
+  (let [wire   (atom [])
+        closes (atom 0)
+        target (reify body/Sink
+                 (sink-write! [_ bs off len]
+                   (swap! wire into
+                          (subvec (m/->octets bs)
+                                  (long off)
+                                  (+ (long off) (long len)))))
+                 (sink-close! [_] (swap! closes inc)))
+        sink   (body/coalescing-sink (body/chunked-sink target) 16)
+        data   (m/->ba [1 2 3 4 5])]
+    (body/sink-write! sink data 0 (alength data))
+    ;; A custom StreamableBody may close explicitly; the HTTP adapter closes in
+    ;; finally as well. Both calls must collapse to one terminator and one
+    ;; downstream close.
+    (body/sink-close! sink)
+    (body/sink-close! sink)
+    (let [{:keys [responses error trailing]}
+          (m/read-responses
+           (into (m/ascii
+                  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                 @wire))]
+      (is (= 1 @closes) "the downstream sink is finalized once")
+      (is (nil? error) "the single chunk terminator is valid")
+      (is (empty? trailing) "a second terminator is not emitted")
+      (is (= [[1 2 3 4 5]] (mapv :body responses))))))
+
+(deftest guarded-nonzero-offset-sinks-exclude-guards
+  (let [payload [1 2 3 4 5 6 7]
+        guarded (m/->ba (concat [240 241] payload [242 243]))]
+    (let [wire   (atom [])
+          sink   (body/coalescing-sink (recording-sink wire) 3)]
+      (body/sink-write! sink guarded 2 (count payload))
+      (body/sink-close! sink)
+      (is (= payload @wire)
+          "coalescing copies only the requested nonzero-offset range"))
+    (let [wire   (atom [])
+          sink   (body/chunked-sink (recording-sink wire))]
+      (body/sink-write! sink guarded 2 (count payload))
+      (body/sink-close! sink)
+      (let [resp (m/read-response
+                  (into (m/ascii
+                         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        @wire))]
+        (is (nil? (:error resp)))
+        (is (= payload (:body resp))
+            "chunk framing excludes prefix and suffix guards")))))
+
 (deftest chunked-sink-round-trips-through-the-model-dechunker
   (with (assoc opts :name "body/chunked-sink")
         [writes (g/vector {:max-size 8} (g/vector {:max-size 256} (g/octet)))]
@@ -311,8 +430,8 @@
 (deftest request-body-concatenates-its-chunks
   (with (assoc opts :test-cases 100 :name "body/request-body")
         [chunks (g/vector {:max-size 8} (g/vector {:min-size 1 :max-size 256} (g/octet)))]
-    ;; body-bytes rebuilds one array from the chunks the parser pushed; jolt has
-    ;; no System/arraycopy, so concat-chunks does the offset arithmetic by hand.
+    ;; body-bytes rebuilds one array from the chunks the parser pushed through
+    ;; the fork's overlap-safe System/arraycopy implementation.
         (let [{:keys [ch body]} (body/request-body (max 1 (count chunks)))
               feeder (future (doseq [c chunks] (a/>!! ch (m/->ba c)))
                              (a/close! ch))

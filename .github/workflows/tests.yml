@@ -1,0 +1,102 @@
+name: tests
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  test:
+    name: POSIX runtime suite (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: macOS arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install source-build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev \
+            libncurses-dev uuid-dev libssl-dev
+
+      - name: Install source-build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install lz4 openssl@3
+
+      - name: Cache Chez Scheme (Linux)
+        if: runner.os == 'Linux'
+        id: cache-chez-linux
+        uses: actions/cache@v4
+        with:
+          path: ~/chez
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
+
+      - name: Build official Chez Scheme v10.4.1 from source (Linux)
+        if: runner.os == 'Linux' && steps.cache-chez-linux.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v10.4.1 \
+            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
+          cd "$RUNNER_TEMP/chez-src"
+          ./configure --installprefix="$HOME/chez" --threads --disable-x11
+          make -j"$(nproc)"
+          make install
+
+      - name: Cache Chez Scheme (macOS)
+        if: runner.os == 'macOS'
+        id: cache-chez-macos
+        uses: actions/cache@v4
+        with:
+          path: ~/chez
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
+
+      - name: Build official Chez Scheme v10.4.1 from source (macOS)
+        if: runner.os == 'macOS' && steps.cache-chez-macos.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v10.4.1 \
+            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
+          cd "$RUNNER_TEMP/chez-src"
+          ./configure --installprefix="$HOME/chez" --threads --disable-x11
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Provide and assert official Chez v10.4.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$HOME/chez/bin"
+          test -x "$bindir/scheme"
+          printf '#!/bin/sh\nexec %s "$@"\n' "$bindir/scheme" > "$bindir/chez"
+          chmod +x "$bindir/chez"
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$bindir/chez" --version | tee /tmp/chez-version
+          grep -Fq '10.4.1' /tmp/chez-version
+
+      - name: Checkout pinned Jolt fork
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: ecf7728f15d8b8f858327c47dbd8b751eb36798c
+          submodules: recursive
+          path: jolt
+
+      - name: Install libhegel
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" \
+            -A:test -m hegel.install
+
+      - name: Run tests
+        shell: bash
+        run: |
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test
+
+# Windows is intentionally absent until jolt.net has a Windows readiness poller.

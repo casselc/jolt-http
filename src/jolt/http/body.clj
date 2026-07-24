@@ -72,8 +72,44 @@
 
 ;; --- header helpers --------------------------------------------------------
 
+(def ^:const max-content-length
+  "Largest Content-Length the parser's signed 64-bit remaining-byte counter can
+  represent."
+  9223372036854775807)
+
+(def ^:private max-content-length-text "9223372036854775807")
+
+(defn- ascii-decimal-digit? [c]
+  (let [n (int c)]
+    (and (<= 0x30 n) (<= n 0x39))))
+
+(defn parse-content-length
+  "Parse one canonical decimal Content-Length, or return nil.
+
+  Range is checked from the decimal text before parsing. This keeps the function
+  total without constructing an arbitrary-precision integer for an attacker-
+  supplied field, and guarantees the later signed-long body counter conversion
+  cannot overflow. Leading zeroes remain valid HTTP decimal syntax."
+  [value]
+  (when (and (string? value)
+             (pos? (count value))
+             (every? ascii-decimal-digit? value))
+    (let [n     (count value)
+          start (loop [i 0]
+                  (if (and (< i n) (= \0 (nth value i)))
+                    (recur (inc i))
+                    i))]
+      (if (= start n)
+        0
+        (let [digits (subs value start)
+              width  (count digits)]
+          (when (or (< width (count max-content-length-text))
+                    (and (= width (count max-content-length-text))
+                         (not (pos? (compare digits max-content-length-text)))))
+            (long (parse-long digits))))))))
+
 (defn content-length [{:strs [content-length]}]
-  (some-> content-length parse-long))
+  (parse-content-length content-length))
 
 (defn chunked-transfer? [{:strs [transfer-encoding]}]
   (and transfer-encoding
@@ -111,8 +147,9 @@
   response, desynchronises jolt-tcp's write-credit accounting, and wedges the
   reactor.
 
-  jolt-tcp copies into its FFI send buffer anyway, so this costs one extra
-  in-heap copy per flush."
+  jolt-tcp now borrows the exact queued Buffer range through jolt.net until its
+  callback fires. The snapshot is therefore the explicit ownership handoff: it
+  is the one copy that lets the connection response buffer be reused safely."
   ([socket buffer] (queue-write! socket buffer nil))
   ([socket buffer callback]
    (buf/flip buffer)
@@ -211,14 +248,67 @@
            (when @closed
              (throw (ex-info "Sink closed" {:err ::sink-closed})))
            (when (pos? (long len))
-             (let [p (promise)]
-               (tcp/write socket (wrap-range bs off len) (fn [] (deliver p true)))
-               @p))))
+             (let [{:keys [status exception] :as outcome}
+                   @(tcp/write-completion socket (wrap-range bs off len))]
+               (case status
+                 :written nil
+                 :failed  (throw exception)
+                 (throw
+                  (ex-info "Unknown socket write completion"
+                           {:err ::invalid-write-completion
+                            :outcome outcome})))))))
        (sink-close! [_]
          (with-lock lock
            (when-not @closed
              (vreset! closed true)
              (on-close socket))))))))
+
+(defn coalescing-sink
+  "Buffer small writes into chunks of at most `capacity` before forwarding them.
+
+  Generic sequential response bodies commonly produce hundreds of sub-kilobyte
+  elements. A socket Sink waits for one reactor completion per forwarded write,
+  so forwarding every element turns a 200KB response into hundreds of scheduler
+  round trips. This wrapper preserves byte order and blocking completion while
+  bounding those round trips by the number of filled coalescing buffers."
+  [sink capacity]
+  (let [capacity (max 1 (long capacity))
+        storage  (byte-array capacity)
+        used     (volatile! 0)
+        closed   (volatile! false)
+        lock     (java.util.concurrent.locks.ReentrantLock.)]
+    (letfn [(flush-buffer! []
+              (let [n (long @used)]
+                (when (pos? n)
+                  ;; The downstream socket Sink blocks until the write drains,
+                  ;; so storage is no longer borrowed when this call returns.
+                  (sink-write! sink storage 0 n)
+                  (vreset! used 0))))
+            (append! [bs off len]
+              (loop [src-off (long off)
+                     left    (long len)]
+                (when (pos? left)
+                  (let [free (- capacity (long @used))
+                        n    (min free left)
+                        dst  (long @used)]
+                    (System/arraycopy bs src-off storage dst n)
+                    (vswap! used + n)
+                    (when (= capacity (long @used))
+                      (flush-buffer!))
+                    (recur (+ src-off n) (- left n))))))]
+      (reify Sink
+        (sink-write! [_ bs off len]
+          (with-lock lock
+            (when @closed
+              (throw (ex-info "Sink closed" {:err ::sink-closed})))
+            (when (pos? (long len))
+              (append! bs off len))))
+        (sink-close! [_]
+          (with-lock lock
+            (when-not @closed
+              (vreset! closed true)
+              (flush-buffer!)
+              (sink-close! sink))))))))
 
 (defn chunked-sink
   "Wrap a Sink so each write becomes an HTTP chunk, and close emits the
@@ -229,11 +319,17 @@
     (reify Sink
       (sink-write! [_ bs off len]
         (when (pos? (long len))
-          (let [header (ascii-bytes (format "%X\r\n" len))]
+          (let [header (ascii-bytes (format "%X\r\n" len))
+                hlen   (alength header)
+                wire   (byte-array (+ hlen (long len) (alength crlf)))]
+            ;; One framed write means one socket/reactor handoff. The outer
+            ;; coalescing Sink bounds this allocation to the response buffer
+            ;; size for the generic sequential-body path.
+            (System/arraycopy header 0 wire 0 hlen)
+            (System/arraycopy bs off wire hlen len)
+            (System/arraycopy crlf 0 wire (+ hlen (long len)) (alength crlf))
             (with-lock lock
-              (sink-write! sink header 0 (alength header))
-              (sink-write! sink bs off len)
-              (sink-write! sink crlf 0 (alength crlf))))))
+              (sink-write! sink wire 0 (alength wire))))))
       (sink-close! [_]
         (with-lock lock
           (when-not @closed
@@ -258,8 +354,6 @@
         (when (pos? (long @left))
           (tcp/close socket))))))
 
-;; --- streamable bodies -----------------------------------------------------
-
 ;; --- request bodies --------------------------------------------------------
 
 (defprotocol RequestBody
@@ -279,7 +373,7 @@
         out   (byte-array total)]
     (loop [cs chunks off 0]
       (if-let [^bytes c (first cs)]
-        (do (dotimes [i (alength c)] (aset out (+ off i) (aget c i)))
+        (do (System/arraycopy c 0 out off (alength c))
             (recur (rest cs) (+ off (alength c))))
         out))))
 
@@ -315,8 +409,14 @@
 ;; --- streamable bodies -----------------------------------------------------
 
 (defprotocol StreamableBody
-  "The `ring.core.protocols/StreamableResponseBody` analogue: write `body` to a
-  Sink. Extend this to make a custom type usable as a response body."
+  "The `ring.core.protocols/StreamableResponseBody` analogue: synchronously
+  write `body` to a Sink and return only after the final write.
+
+  Sink lifetime belongs to the HTTP adapter. Implementations may close it early
+  to signal completion, but need not do so; close is idempotent and the adapter
+  closes exactly once observably after this method returns. A body that wants to
+  outlive this call needs a future outcome-aware streaming SPI rather than
+  retaining this blocking Sink."
   (write-body-to-sink [body response sink]))
 
 (defn- copy-stream-to-sink [in sink]

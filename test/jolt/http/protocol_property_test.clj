@@ -155,6 +155,64 @@
                    (doseq [[k v] (:headers model)]
                      (is (= v (get got k)) (str "header " (pr-str k))))))))))))
 
+(deftest aggregate-header-count-is-an-exact-boundary
+  (with (assoc opts :test-cases 120 :name "protocol/header-count-boundary")
+        [extra-fields (g/integer 0 8)
+         cap          (g/integer 1 9)]
+        (let [field-lines (mapv (fn [i] [(str "X-" i) "v"])
+                                (range extra-fields))
+              raw         (m/render-request {:method "GET"
+                                             :target "/"
+                                             :field-lines field-lines
+                                             :body []
+                                             :body-framing :none})
+              actual      (inc extra-fields)]
+          (run-conn
+           hello-handler {:max-header-count cap :max-header-bytes 65536}
+           (fn [conn]
+             (fs/feed-all! conn raw)
+             (let [{:keys [responses error trailing]} (await-responses! conn 1)
+                   r (first responses)]
+               (h/fprn :minimal-extra-fields extra-fields
+                       :actual-fields actual :cap cap)
+               (is (nil? error))
+               (is (empty? trailing))
+               (is (= 1 (count responses)))
+               (when r
+                 (is (= (if (<= actual cap) 200 431) (:status r))))))))))
+
+(deftest aggregate-header-bytes-include-the-final-crlf
+  (with (assoc opts :test-cases 120 :name "protocol/header-byte-boundary")
+        [extra-fields (g/integer 0 6)
+         value-size   (g/integer 0 16)
+         delta        (g/integer -1 1)]
+        (let [value       (apply str (repeat value-size "v"))
+              field-lines (mapv (fn [i] [(str "X-" i) value])
+                                (range extra-fields))
+              raw         (m/render-request {:method "GET"
+                                             :target "/"
+                                             :field-lines field-lines
+                                             :body []
+                                             :body-framing :none})
+              request-line-end (str/index-of (m/octets->str raw) "\r\n")
+              section-bytes (- (count raw) (+ request-line-end 2))
+              cap           (+ section-bytes delta)]
+          (run-conn
+           hello-handler {:max-header-count 100 :max-header-bytes cap}
+           (fn [conn]
+             (fs/feed-all! conn raw)
+             (let [{:keys [responses error trailing]} (await-responses! conn 1)
+                   r (first responses)]
+               (h/fprn :minimal-extra-fields extra-fields
+                       :value-size value-size
+                       :section-bytes section-bytes :cap cap)
+               (is (nil? error))
+               (is (empty? trailing))
+               (is (= 1 (count responses)))
+               (when r
+                 (is (= (if (<= section-bytes cap) 200 431)
+                        (:status r))))))))))
+
 ;; --- 3. the two body framings agree ----------------------------------------
 
 (deftest content-length-and-chunked-deliver-the-same-body
@@ -406,6 +464,67 @@
                (when r
                  (is (nil? (m/header r "X-Injected")) "nothing was injected"))))))))
 
+(deftest response-metadata-is-canonical-or-fails-closed
+  (with (assoc opts :test-cases 180 :name "protocol/response-metadata")
+        [status-class (g/sampled-from [:valid :low :high :text :fraction
+                                      :false :nil])
+         cl-class     (g/sampled-from [:none :valid :duplicate :conflict
+                                       :overflow :syntax])
+         te-class     (g/sampled-from [:none :chunked :unsupported :duplicate])]
+        (let [status  (case status-class
+                        :valid 200
+                        :low 99
+                        :high 1000
+                        :text "200"
+                        :fraction 200.5
+                        :false false
+                        :nil nil)
+              cl      (case cl-class
+                        :none {}
+                        :valid {"Content-Length" "5"}
+                        :duplicate {"Content-Length" "5"
+                                    "content-length" "5"}
+                        :conflict {"Content-Length" "5"
+                                   "content-length" "6"}
+                        :overflow {"Content-Length" "9223372036854775808"}
+                        :syntax {"Content-Length" "+5"})
+              te      (case te-class
+                        :none {}
+                        :chunked {"Transfer-Encoding" "chunked"}
+                        :unsupported {"Transfer-Encoding" "gzip"}
+                        :duplicate {"Transfer-Encoding" "chunked"
+                                    "transfer-encoding" "chunked"})
+              invalid? (or (not= status-class :valid)
+                           (contains? #{:conflict :overflow :syntax} cl-class)
+                           (contains? #{:unsupported :duplicate} te-class))]
+          (run-conn
+           (fn [_] {:status status :headers (merge cl te) :body "HELLO"})
+           (fn [conn]
+             (fs/feed-all!
+              conn
+              (m/ascii
+               "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"))
+             (let [{:keys [responses error trailing]} (await-responses! conn 1)
+                   r (first responses)]
+               (h/fprn :status-class status-class
+                       :content-length-class cl-class
+                       :transfer-encoding-class te-class)
+               (is (nil? error))
+               (is (empty? trailing))
+               (is (= 1 (count responses)))
+               (when r
+                 (is (= (if invalid? 500 200) (:status r)))
+                 (when-not invalid?
+                   (if (= te-class :chunked)
+                     (do
+                       (is (= "chunked" (m/header r "Transfer-Encoding")))
+                       (is (nil? (m/header r "Content-Length"))))
+                     (when (contains? #{:valid :duplicate} cl-class)
+                       (is (= "5" (m/header r "Content-Length")))
+                       (is (= 1
+                              (count
+                               (get (:headers r) "content-length"))))))))))))))
+
 ;; --- 8. mutation fuzz: never two answers, never a spin ---------------------
 
 (defn- mutate
@@ -489,6 +608,62 @@
                      (is (fs/closed? conn)
                          "and the connection is closed behind it"))))))))))
 
+(deftest terminal-eof-rejects-every-nonempty-request-prefix
+  (with (assoc opts :test-cases 180 :name "protocol/truncated-eof")
+        []
+        (g/let [{:keys [bytes]} (m/draw-request!)
+                cut (g/integer 0 (dec (count bytes)))]
+          (run-conn
+           ;; The handler drains the request body. A handler that intentionally
+           ;; answers before consuming a streaming body may legitimately win
+           ;; the response slot before a later EOF exposes truncation; this
+           ;; property is about parser states that are still waiting.
+           echo-request-handler {:read-buffer-size 512}
+           (fn [conn]
+             (fs/feed-all! conn (subvec (vec bytes) 0 cut))
+             (fs/half-close! conn)
+             (fs/await! conn #(fs/closed? conn))
+             (let [{:keys [responses error trailing]} (responses-of conn)]
+               (h/fprn :minimal-cut cut :request-size (count bytes))
+               (is (fs/closed? conn)
+                   "terminal EOF cannot leave a parser state waiting for bytes")
+               (is (nil? error))
+               (is (empty? trailing))
+               (if (zero? cut)
+                 (is (empty? responses)
+                     "an idle connection can close without an HTTP response")
+                 (do
+                   (is (= 1 (count responses))
+                       "a nonempty incomplete message gets one response")
+                   (when-some [r (first responses)]
+                     (is (= 400 (:status r))))))))))))
+
+(deftest terminal-eof-does-not-duplicate-an-already-claimed-response
+  (run-conn
+   ;; Deliberately answer without consuming the streaming body. Once this 202
+   ;; has claimed the request's response slot, later truncation must close the
+   ;; connection rather than append a 400.
+   (fn [_] {:status 202 :headers {} :body "accepted"})
+   (fn [conn]
+     (fs/feed-all!
+      conn
+      (m/ascii (str "POST / HTTP/1.1\r\nHost: h\r\n"
+                    "Content-Length: 5\r\n\r\n")))
+     (let [{before :responses} (await-responses! conn 1)]
+       (is (= [202] (mapv :status before))
+           "the handler claims the response before terminal EOF"))
+     (fs/feed-all! conn (m/ascii "abc"))
+     (fs/half-close! conn)
+     (fs/await! conn #(fs/closed? conn))
+     (let [{:keys [responses error trailing]} (responses-of conn)]
+       (is (fs/closed? conn))
+       (is (nil? error))
+       (is (empty? trailing))
+       (is (= [202] (mapv :status responses))
+           "body truncation does not append a second response")
+       (is (= 1 (m/status-lines (fs/written conn)))
+           "exactly one response was accepted")))))
+
 (deftest a-well-formed-request-is-never-rejected
   (with (assoc opts :test-cases 150 :name "protocol/no-false-rejection")
         []
@@ -516,8 +691,8 @@
 
 (defn- expected-response-for [kind path]
   (case kind
-    :head {:head? true :body ""}
-    {:head? false :body path}))
+    :head {:head? true :status 200 :body ""}
+    {:head? false :status 200 :body path}))
 
 (deftest connection-stateful-model
   (with (assoc opts :test-cases 120 :name "protocol/stateful")
@@ -574,9 +749,16 @@
           ;; the peer half-closes: everything already sent must still be answered
               (hs/rule :half-close
                        {:precondition (fn [{:keys [eof?]}] (not eof?))}
-                       (fn [{:keys [conn] :as state}]
+                       (fn [{:keys [conn partial pending] :as state}]
                          (fs/half-close! conn)
-                         (assoc state :eof? true)))
+                         (cond-> (assoc state :eof? true)
+                           partial
+                           (assoc :partial nil
+                                  :pending
+                                  (conj pending
+                                        {:head? false
+                                         :status 400
+                                         :body "Request ended before its framing was complete."})))))
 
           ;; read one response off the wire and check it is the right one
               (hs/rule :drain-one
@@ -593,9 +775,10 @@
                                               :error (:error got)})))
                            (let [r    (nth rs want)
                                  spec (first pending)]
-                             (when (not= 200 (:status r))
+                             (when (not= (:status spec) (:status r))
                                (throw (ex-info "unexpected status"
                                                {:hegel/origin "protocol/stateful/status"
+                                                :want (:status spec)
                                                 :status (:status r)})))
                              (when-not (= (:body spec) (m/body-str r))
                                (throw (ex-info "response does not match its request"
