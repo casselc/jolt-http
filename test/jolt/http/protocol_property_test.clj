@@ -29,11 +29,13 @@
             [hegel.stateful :as hs]
             [jolt.http.body :as body]
             [jolt.http.fake-socket :as fs]
+            [jolt.http.hegel-support :as hegel-support]
             [jolt.http.http-model :as m]
             [jolt.http.reason :as reason]))
 
 (def ^:private opts
-  {:test-cases 200 :database "" :verbosity :quiet})
+  (hegel-support/run-opts
+   {:test-cases 200 :database "" :verbosity :quiet}))
 
 ;; --- handlers --------------------------------------------------------------
 
@@ -98,6 +100,34 @@
   view of a client that wrote in several pieces."
   [conn chunks]
   (doseq [c chunks] (fs/feed-all! conn c)))
+
+(deftest fake-close-awaits-streaming-handler-settlement
+  (let [entered  (promise)
+        finished (promise)
+        conn
+        (fs/ring-conn
+         (fn [req]
+           (deliver entered true)
+           (try
+             (body/body-bytes (:body req))
+             (finally (deliver finished true)))
+           {:status 200 :headers {} :body "closed"}))]
+    (try
+      ;; Start a streaming handler, but deliberately leave its body incomplete.
+      ;; Harness cleanup must close the channel and wait until that executor task
+      ;; has actually unwound before the next generated case can start.
+      (fs/feed-all!
+       conn
+       (m/ascii
+        "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n"))
+      (is (= true (deref entered 1000 false))
+          "the streaming handler is parked on its request body")
+      (fs/close-conn! conn)
+      (is (= true (deref finished 0 false))
+          "fake close is a handler-task settlement barrier")
+      (finally
+        (when-not (fs/closed? conn)
+          (try (fs/close-conn! conn) (catch :default _ nil)))))))
 
 ;; --- 1. framing is invariant under chunking --------------------------------
 

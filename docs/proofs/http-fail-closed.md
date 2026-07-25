@@ -19,15 +19,16 @@ A valid `Transfer-Encoding: chunked` takes precedence over a valid
 
 ### Source facts
 
-- `src/jolt/http/protocol.clj:460-520` classifies unsafe response headers,
-  representable decimal content lengths, transfer encoding, and three-digit
-  integer statuses.
-- `src/jolt/http/protocol.clj:554-594` constructs one `problems` collection,
+- `jolt.http.protocol/unsafe-field-value?`, `content-length-state`,
+  `transfer-encoding-state`, and `valid-status?` classify unsafe response
+  headers, representable decimal content lengths, transfer encoding, and
+  three-digit integer statuses.
+- `jolt.http.protocol/sanitize-response` constructs one `problems` collection,
   returns the fixed 500 when it is nonempty, and otherwise removes both original
   framing fields before adding at most one canonical field.
-- `src/jolt/http/protocol.clj:584-591` selects chunked transfer encoding before
-  content length, so both fields cannot be emitted.
-- `src/jolt/http/protocol.clj:607-697` sanitizes before clearing or writing the
+- `jolt.http.protocol/sanitize-response` selects chunked transfer encoding
+  before content length, so both fields cannot be emitted.
+- `jolt.http.protocol/ring-responder` sanitizes before clearing or writing the
   response buffer.
 
 The finite model has two status classes, two header classes, three content-length
@@ -64,13 +65,13 @@ handler mode and custom-body close behavior.
 
 ### Source facts
 
-- `src/jolt/http/protocol.clj:301-325` creates the sink chain and closes it in
+- `jolt.http.protocol/write-via-sink` creates the sink chain and closes it in
   `finally` without conditioning on handler mode.
-- `src/jolt/http/body.clj:266-311` makes the coalescing wrapper's close
+- `jolt.http.body/coalescing-sink` makes the coalescing wrapper's close
   idempotent and flushes buffered bytes before delegating close.
-- `src/jolt/http/body.clj:313-338` makes the chunked wrapper's close idempotent,
+- `jolt.http.body/chunked-sink` makes the chunked wrapper's close idempotent,
   emits one terminal chunk, and delegates one downstream close.
-- `src/jolt/http/body.clj:413-422` documents the synchronous body contract and
+- `jolt.http.body/StreamableBody` documents the synchronous body contract and
   forbids retaining the sink.
 
 The Z3 model ranges over both Boolean handler modes and both custom-body close
@@ -109,17 +110,18 @@ than one response.
 
 ### Source facts
 
-- `src/jolt/http/protocol.clj:233-266` turns EOF during a partial header section
+- `jolt.http.protocol/read-header` turns EOF during a partial header section
   into `:incomplete-request`.
-- `src/jolt/http/protocol.clj:990-1056` turns EOF in fixed-length, chunk-size,
-  chunk-data, chunk-CRLF, and trailer states into an incomplete-body error.
-- `src/jolt/http/protocol.clj:1066-1078` closes an idle connection only after the
+- `jolt.http.protocol/read-chunked-body` and `read-known-length-body` turn EOF
+  in fixed-length, chunk-size, chunk-data, chunk-CRLF, and trailer states into
+  an incomplete-body error.
+- `jolt.http.protocol/buffer-reads` closes an idle connection only after the
   previous response is complete and no buffered request remains.
-- `src/jolt/http/protocol.clj:924-939` atomically distinguishes an available
+- `jolt.http.protocol/body-error` atomically distinguishes an available
   body-response slot from one an early handler response already claimed.
-- `src/jolt/http/protocol.clj:1080-1098` closes after the error response and
+- `jolt.http.protocol/write-error-response` closes after the error response and
   returns `:done`, preventing re-entry and a second error write.
-- `src/jolt/http/protocol.clj:1127-1142` has no transition out of `:done`.
+- `jolt.http.protocol/tcp-handler` has no transition out of `:done`.
 
 The Prolog model enumerates the parser-state classes involved at EOF and, for
 body states, both response-slot ownership values. Its violation query checks for
@@ -146,26 +148,35 @@ commented queries in the non-vacuity model as a batch.
 
 ## Implementation witnesses and bounds
 
-- `test/jolt/http/server_test.clj:254-315` pins invalid response metadata,
-  canonical framing, and fail-closed output.
-- `test/jolt/http/server_test.clj:878-1014` covers every incomplete EOF class,
-  aggregate header boundaries, and unrepresentable content length.
-- `test/jolt/http/server_test.clj:1059-1090` checks that sequential and custom
-  streamable bodies terminate exactly once.
-- `test/jolt/http/server_test.clj:1220-1272` injects a deterministic
-  connection-reset outcome after request admission and proves the async response
-  task unblocks.
-- `test/jolt/http/body_property_test.clj:158-186` checks content-length bounds
-  and total parsing across generated decimal strings.
-- `test/jolt/http/body_property_test.clj:344-370` observes one downstream close
-  and one chunk terminator after both a custom close and the adapter's final
-  close.
-- `test/jolt/http/protocol_property_test.clj:158-214` generates exact aggregate
+- `jolt.http.server-test/test-response-metadata-fails-closed` pins invalid
+  response metadata, canonical framing, and fail-closed output.
+- `jolt.http.server-test/test-incomplete-request-eof-is-terminal` covers every
+  incomplete EOF class, aggregate header boundaries, and unrepresentable
+  content length.
+- `jolt.http.server-test/test-async-streamable-bodies-finalize` checks that
+  sequential and custom streamable bodies terminate exactly once.
+- `jolt.http.server-test/test-peer-reset-unblocks-streaming-response` injects a
+  deterministic connection-reset outcome after request admission and proves
+  the async response task unblocks.
+- `jolt.http.body-property-test/content-length-is-bounded-by-the-parser-counter`,
+  `content-length-parser-is-total-over-decimal-input`, and
+  `content-length-range-check-does-not-need-a-wide-integer` check bounds and
+  total parsing across generated decimal strings.
+- `jolt.http.body-property-test/sink-chain-finalization-is-observably-exactly-once`
+  observes one downstream close and one chunk terminator after both a custom
+  close and the adapter's final close.
+- `jolt.http.protocol-property-test/aggregate-header-count-is-an-exact-boundary`
+  and `aggregate-header-bytes-include-the-final-crlf` generate exact aggregate
   header byte/count boundaries.
-- `test/jolt/http/protocol_property_test.clj:467-523` generates response status
-  and framing classes and requires either canonical output or a safe 500.
-- `test/jolt/http/protocol_property_test.clj:608-662` covers every nonempty EOF
-  prefix and the already-claimed response branch.
+- `jolt.http.protocol-property-test/response-metadata-is-canonical-or-fails-closed`
+  generates response status and framing classes and requires either canonical
+  output or a safe 500.
+- `jolt.http.protocol-property-test/terminal-eof-rejects-every-nonempty-request-prefix`
+  and `terminal-eof-does-not-duplicate-an-already-claimed-response` cover every
+  nonempty EOF prefix and the already-claimed response branch.
+- `jolt.http.protocol-property-test/fake-close-awaits-streaming-handler-settlement`
+  pins the test harness's cleanup assumption: closing an incomplete request-body
+  channel is a barrier for that connection's submitted handler work.
 
 The response model deliberately collapses byte strings into syntax/framing
 classes; classification correctness is tested, not proven by Z3. The EOF model

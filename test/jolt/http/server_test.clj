@@ -10,7 +10,7 @@
   explicit `System/exit` is required: core.async keeps non-daemon threads alive
   and the process would otherwise hang on return."
   (:require [clojure.string :as str]
-            [clojure.test]
+            [clojure.test :as t]
             [jolt.http.body :as body]
             [jolt.http.date :as date]
             [jolt.http.http-model :as model]
@@ -1309,8 +1309,51 @@
 
 ;; --- generative layers -----------------------------------------------------
 
+(def ^:private progress-file
+  (.getAbsolutePath
+   (java.io.File.
+    (or (System/getProperty "java.io.tmpdir") ".")
+    "jolt-http-test-progress.log")))
+
+(defn- reset-progress! []
+  ;; Core's atomic spit contract replaces an existing destination on every
+  ;; supported host; keep the harness on that public path.
+  (spit progress-file "start\n"))
+
+(defn- property-progress! [phase name]
+  (let [line (str "PROPERTY-" phase " " name)]
+    (println line)
+    (flush)
+    (spit progress-file (str line "\n") :append true)))
+
+(defn- with-property-progress [ns-sym f]
+  ;; Jolt's clojure.test runner does not emit :begin-test-var events. Wrap only
+  ;; this namespace's registered thunks so a bounded outer watchdog leaves the
+  ;; exact property name in both stdout and the progress file.
+  (let [original @t/registry]
+    (try
+      (swap!
+       t/registry
+       (fn [entries]
+         (mapv
+          (fn [entry]
+            (if (= ns-sym (:ns entry))
+              (let [name (:name entry)
+                    run  (:fn entry)]
+                (assoc entry :fn
+                       (fn []
+                         (property-progress! "BEGIN" name)
+                         (try (run)
+                              (finally
+                                (property-progress! "END" name))))))
+              entry))
+          entries)))
+      (f)
+      (finally
+        (reset! t/registry original)))))
+
 (defn- run-clojure-test-ns [ns-sym]
-  (let [s (clojure.test/run-tests ns-sym)]
+  (let [s (t/run-tests ns-sym)]
     (swap! failures + (+ (:fail s 0) (:error s 0)))
     (swap! checks + (:pass s 0))))
 
@@ -1318,7 +1361,9 @@
   (run-clojure-test-ns 'jolt.http.body-property-test))
 
 (defn- test-protocol-properties []
-  (run-clojure-test-ns 'jolt.http.protocol-property-test))
+  (with-property-progress
+    'jolt.http.protocol-property-test
+    #(run-clojure-test-ns 'jolt.http.protocol-property-test)))
 
 (defn- test-loopback-properties []
   (let [before (jolt.http.server-property-test/failure-count)]
@@ -1394,32 +1439,34 @@
    ["protocol properties"  test-protocol-properties  300000]
    ["loopback properties"  test-loopback-properties  600000]])
 
-;; Progress is written to a file as well as printed: jolt block-buffers stdout
-;; when it is piped or redirected, so on a hang the printed output is lost and
-;; this file is the only record of how far the run got.
-(def ^:private progress-file "/tmp/jolt-http-test-progress.log")
-
 (defn -main [& args]
-  (let [only (set args)]
-    (spit progress-file "start\n")
+  (let [only       (set args)
+        timed-out? (atom false)]
+    (reset-progress!)
     (doseq [[label f timeout-ms] scenarios]
-      (when (or (empty? only) (contains? only label))
+      (when (and (not @timed-out?)
+                 (or (empty? only) (contains? only label)))
         (println (str "\n== " label " =="))
         (spit progress-file (str "BEGIN " label "\n") :append true)
         ;; Watchdog. The loopback client does a blocking recv with no socket
         ;; timeout, so a response that never arrives would hang the run forever
         ;; instead of failing it. Bound each scenario and report a timeout as a
         ;; failure so CI stays informative.
-        (let [done (future
-                     (try (f) :ok
-                          (catch :default e
-                            (swap! failures inc)
-                            (println "FAIL" label "threw:" (ex-message e))
-                            :threw)))]
-          (when (= :TIMEOUT (deref done (or timeout-ms 60000) :TIMEOUT))
+        (let [done    (future
+                        (try (f) :ok
+                             (catch :default e
+                               (swap! failures inc)
+                               (println "FAIL" label "threw:" (ex-message e))
+                               :threw)))
+              outcome (deref done (or timeout-ms 60000) :TIMEOUT)]
+          (when (= :TIMEOUT outcome)
             (swap! failures inc)
-            (println "FAIL" label "timed out after" (or timeout-ms 60000) "ms")))
-        (spit progress-file (str "END   " label "\n") :append true))))
+            (reset! timed-out? true)
+            (println "FAIL" label "timed out after" (or timeout-ms 60000) "ms"))
+          (spit progress-file
+                (str (if (= :TIMEOUT outcome) "TIMEOUT " "END   ")
+                     label "\n")
+                :append true)))))
   (println (str "\n" @checks " checks, " @failures " failures"))
   (flush)
   ;; core.async holds non-daemon threads; the process will not exit on its own.

@@ -34,11 +34,14 @@
             [hegel.report :as report]
             [hegel.stateful :as hs]
             [jolt.http.body :as body]
+            [jolt.http.hegel-support :as hegel-support]
             [jolt.http.http-model :as m]
             [jolt.http.server :as http]
             [teensyp.ffi-net :as net]))
 
-(def ^:private run-opts {:test-cases 30 :database "" :verbosity :quiet})
+(def ^:private run-opts
+  (hegel-support/run-opts
+   {:test-cases 30 :database "" :verbosity :quiet}))
 
 ;; Out-of-band failure log. A libhegel-detected nondeterministic run comes back
 ;; with :failures [] and no counterexample, so the only record of what actually

@@ -12,8 +12,12 @@ jobs:
         include:
           - name: Linux x86_64
             runner: ubuntu-24.04
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
           - name: macOS arm64
             runner: macos-14
+          - name: macOS x86_64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -84,9 +88,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: ecf7728f15d8b8f858327c47dbd8b751eb36798c
+          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
           submodules: recursive
           path: jolt
+
+      # libhegel 0.30.1 has no Darwin/x86_64 release asset. Build the exact
+      # tagged source so Intel macOS still runs every HTTP property group.
+      - name: Checkout pinned libhegel source (macOS x86_64)
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        uses: actions/checkout@v4
+        with:
+          repository: hegeldev/hegel-rust
+          ref: f81c6cceabe3c6695a249588c751a5ce93dffa00
+          persist-credentials: false
+          path: hegel-rust
+
+      - name: Build pinned libhegel 0.30.1 (macOS x86_64)
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        working-directory: hegel-rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.86.0 --profile minimal
+          cargo +1.86.0 build --locked -p hegeltest-c --release
+          library="$PWD/target/release/libhegel_c.dylib"
+          test -f "$library"
+          echo "HEGEL_LIBHEGEL_LIBRARY=$library" >> "$GITHUB_ENV"
 
       - name: Install libhegel
         shell: bash
@@ -99,4 +126,182 @@ jobs:
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test
 
-# Windows is intentionally absent until jolt.net has a Windows readiness poller.
+# Windows cannot run the loopback server groups until jolt.net has a Windows
+# readiness backend. Keep a native portable gate: source-build Chez, resolve the
+# exact Jolt/TCP/Hegel graph, load the production HTTP namespaces, and execute
+# the pure writer/date and in-process fake-transport protocol properties.
+  windows-portable:
+    name: portable HTTP gate (Windows x86_64; no socket runtime)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/aot-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 source-build toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-zlib
+
+      - name: Cache Chez Scheme
+        id: cache-chez-windows
+        uses: actions/cache@v4
+        with:
+          path: chez-install
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-mingw64-v1
+
+      - name: Build official Chez Scheme v10.4.1 from source
+        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v10.4.1 \
+            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
+          cd "$RUNNER_TEMP/chez-src"
+          ./configure --threads
+          make -j"$(nproc)"
+          inst="$GITHUB_WORKSPACE/chez-install"
+          mkdir -p "$inst/bin" "$inst/csv"
+          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
+          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
+          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
+          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
+          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
+
+      - name: Provide and assert official Chez v10.4.1
+        run: |
+          set -euo pipefail
+          bindir="$GITHUB_WORKSPACE/chez-install/bin"
+          test -x "$bindir/scheme.exe"
+          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
+          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
+          chmod +x "$bindir/chez" "$bindir/cc"
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
+          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
+          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
+
+      - name: Checkout pinned Jolt fork
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
+          submodules: recursive
+          path: jolt
+
+      - name: Install libhegel
+        env:
+          JOLT_PWD: ${{ github.workspace }}
+          JOLT_SH: 'C:/Program Files/Git/bin/sh.exe'
+        run: |
+          "$GITHUB_WORKSPACE/jolt/bin/joltc" -A:test -m hegel.install
+
+      - name: Run portable HTTP groups
+        env:
+          JOLT_PWD: ${{ github.workspace }}
+          JOLT_SH: 'C:/Program Files/Git/bin/sh.exe'
+        run: |
+          "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test \
+            "date formatting" \
+            "charset parsing" \
+            "pure properties" \
+            "protocol properties"
+
+# Windows ARM64 has no reviewed jolt.net descriptor yet. This public-preview
+# lane therefore runs only the explicit descriptor-independent HTTP tests and
+# verifies that the transport dependency fails closed. It is native source-mode
+# Jolt over tarm64nt Chez: no packaged joltc, devboot, AOT cache, HTTP listener,
+# or Winsock runtime claim.
+  windows-arm64-source-preview:
+    name: source-mode HTTP preview (Windows aarch64; non-AOT, no sockets)
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 35
+    continue-on-error: true
+    env:
+      JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+    steps:
+      - name: Checkout jolt-http
+        uses: actions/checkout@v4
+
+      - name: Checkout official Chez Scheme v10.4.1
+        uses: actions/checkout@v4
+        with:
+          repository: cisco/ChezScheme
+          ref: v10.4.1
+          submodules: recursive
+          persist-credentials: false
+          path: chez-arm64
+
+      - name: Build native ARM64 Chez Scheme from source
+        shell: cmd
+        run: |
+          cd /d "%GITHUB_WORKSPACE%\chez-arm64"
+          call build.bat tarm64nt /only
+
+      - name: Checkout pinned Jolt core
+        uses: actions/checkout@v4
+        with:
+          repository: casselc/jolt
+          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
+          submodules: recursive
+          path: jolt
+
+      - name: Provide native Chez for source-mode Jolt
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+          scheme="$workspace/chez-arm64/tarm64nt/bin/tarm64nt/scheme.exe"
+          bindir="$workspace/.ci-windows-arm64-bin"
+          test -f "$scheme"
+          mkdir -p "$bindir"
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$scheme" > "$bindir/chez"
+          chmod +x "$bindir/chez"
+          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
+          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
+          cygpath -w "$bindir" >> "$GITHUB_PATH"
+          echo 'JOLT_SH=C:/Program Files/Git/bin/sh.exe' >> "$GITHUB_ENV"
+          echo 'JOLT_AOT_CACHE=0' >> "$GITHUB_ENV"
+
+      - name: Run descriptor-independent HTTP tests
+        shell: bash
+        env:
+          JOLT_PWD: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+          "$workspace/jolt/bin/joltc" -A:test -m jolt.http.portable-test
+
+      - name: Require the unreviewed network target to fail closed
+        shell: bash
+        env:
+          JOLT_PWD: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+          "$workspace/jolt/bin/joltc" - <<'EOF'
+          (require '[jolt.net.target :as target])
+          (let [observed (jolt.host/target)
+                error (try
+                        (target/descriptor observed)
+                        nil
+                        (catch Throwable cause cause))]
+            (when-not (= [:windows :aarch64 64]
+                         [(:os observed) (:arch observed) (:pointer-bits observed)])
+              (throw (ex-info "portable HTTP preview did not run on native Windows ARM64"
+                              {:target observed})))
+            (when-not (= :unsupported-target
+                         (:jolt.net/kind (ex-data error)))
+              (throw (ex-info "jolt.net did not fail closed before its ARM64 descriptor"
+                              {:target observed :error error})))
+            (println "PASS portable HTTP logic with network dependency fail-closed"))
+          EOF

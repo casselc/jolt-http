@@ -308,6 +308,57 @@
 (defonce ^:private shared-executor
   (java.util.concurrent.Executors/newFixedThreadPool 16))
 
+(defn- tracking-executor [delegate tasks]
+  (reify java.util.concurrent.Executor
+    (execute [_ task]
+      (swap! tasks update :submitted inc)
+      (try
+        (.execute
+         ^java.util.concurrent.Executor delegate
+         (fn []
+           (swap! tasks
+                  (fn [s]
+                    (let [active (inc (:active s))]
+                      (-> s
+                          (update :started inc)
+                          (assoc :active active)
+                          (update :max-active max active)))))
+           (try
+             (task)
+             (finally
+               (swap! tasks
+                      (fn [s]
+                        (-> s
+                            (update :completed inc)
+                            (update :active dec))))))))
+        (catch :default e
+          (swap! tasks update :rejected inc)
+          (throw e))))))
+
+(defn- tasks-settled? [{:keys [submitted completed rejected]}]
+  (= submitted (+ completed rejected)))
+
+(defn- await-handler-tasks!
+  "Wait for this fake connection's submitted handler tasks to leave the shared
+  executor after its body channel is closed.
+
+  Without this barrier, one generated case can return while its handler is still
+  unwinding. Enough such cases make a later property look deadlocked even though
+  the unfinished work belongs to earlier harness cleanup."
+  [{:keys [handler-tasks] :as conn}]
+  (when handler-tasks
+    (let [deadline (+ (System/currentTimeMillis) 2000)]
+      (loop []
+        (cond
+          (tasks-settled? @handler-tasks) nil
+          (>= (System/currentTimeMillis) deadline)
+          (throw
+           (ex-info "fake connection handler tasks did not settle after close"
+                    {:err ::handler-tasks-not-settled
+                     :tasks @handler-tasks
+                     :closed? (closed? conn)}))
+          :else (do (Thread/sleep 1) (recur)))))))
+
 (defn close-conn!
   "End the connection the way the reactor does when it closes: mark it CLOSED
   and run the handler's close arity, which closes the request-body channel.
@@ -316,10 +367,12 @@
   `body-bytes` on a body that never finished arriving — which is exactly what a
   truncated request in a fuzz property produces — holds a pool thread forever,
   and once the shared pool is full every later case hangs. Closing the channel
-  is what releases it."
-  [{:keys [handler state socket]}]
+  is what releases it. The settlement barrier then proves that all work this
+  connection submitted has left the executor before the next case begins."
+  [{:keys [handler state socket] :as conn}]
   (vswap! (:flags socket) bit-or (long tcp/CLOSED))
   (try (handler @state nil) (catch :default _ nil))
+  (await-handler-tasks! conn)
   nil)
 
 (defn ring-conn
@@ -329,6 +382,10 @@
   ([ring-handler] (ring-conn ring-handler {}))
   ([ring-handler opts]
    (let [opts (merge default-opts opts)
-         opts (assoc opts :executor (or (:executor opts) shared-executor))]
-     (connect (protocol/tcp-handler (sync-ring-handler ring-handler) opts)
-              opts))))
+         tasks (atom {:submitted 0 :started 0 :completed 0 :rejected 0
+                      :active 0 :max-active 0})
+         executor (tracking-executor (or (:executor opts) shared-executor) tasks)
+         opts (assoc opts :executor executor)]
+     (assoc (connect (protocol/tcp-handler (sync-ring-handler ring-handler) opts)
+                     opts)
+            :handler-tasks tasks))))

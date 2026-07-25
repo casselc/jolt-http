@@ -295,13 +295,48 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -A:test -m hegel.install
 JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -M:test
 ```
 
+Linux x86_64 and macOS arm64 have observed native runtime evidence for the
+complete real-loopback suite with source-built Chez 10.4.1. Equivalent
+full-runtime jobs are configured for Linux aarch64 (`ubuntu-24.04-arm`) and
+macOS x86_64 (`macos-15-intel`); treat those new rows as candidate coverage
+until they are observed green on this revision. Because libhegel 0.30.1
+publishes no Darwin/x86_64 asset, the Intel job builds its exact tagged source
+and supplies the resulting library explicitly.
+
+Windows x86_64 has a candidate native portable gate: it loads the production
+HTTP/TCP/net graph and runs date/charset cases plus the pure body and in-process
+fake-transport protocol properties, which exercise parser boundaries without
+opening a listener. It deliberately omits every
+real-loopback group. That job is a compile/load and portable-logic gate, not
+HTTP-over-Winsock support; full Windows runtime coverage waits for `jolt.net`'s
+Windows readiness backend.
+
+Windows aarch64 has a separate non-gating public-preview lane on
+`windows-11-vs2026-arm`. It builds native `tarm64nt` Chez 10.4.1 and runs the
+descriptor-independent RFC-1123 date and status-reason tests in source mode.
+Because jolt-net's ARM64 probe has not yet been reviewed into a descriptor, the
+lane also requires its transport dependency to fail closed; it does not load
+the HTTP/TCP server graph or claim HTTP-over-Winsock support. It uses no
+packaged joltc, devboot, or AOT cache.
+
 Runs a framework-less acceptance suite plus three generative layers
 ([jolt-hegel][]) over real loopback TCP, driving raw
 sockets so that malformed requests, split requests and pipelining can be
-exercised exactly. Scenarios are ported from Capra's test suite. Each scenario
-runs under a 60-second watchdog, because the loopback client uses a blocking
-recv with no socket timeout and a lost response would otherwise hang the run
-instead of failing it.
+exercised exactly. Scenarios are ported from Capra's test suite. Acceptance
+scenarios run under a 60-second watchdog; the pure, in-process protocol, and
+loopback property groups have 180-, 300-, and 600-second bounds respectively.
+The loopback client uses a blocking recv with no socket timeout, so a lost
+response would otherwise hang the run instead of failing it.
+
+Hegel properties derive a stable seed from each property's name by default, so
+the same revision explores the same cases in every CI run. To replay or explore
+one explicit non-negative signed 64-bit seed across a selected property group:
+
+```sh
+JOLT_HTTP_HEGEL_SEED=6635181287260819147 \
+  JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
+  -M:test "protocol properties"
+```
 
 Run a subset by naming scenarios:
 
@@ -311,13 +346,17 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
 ```
 
 The current reviewed core baseline is
-`ecf7728f15d8b8f858327c47dbd8b751eb36798c`. `deps.edn` pins jolt-tcp at
-`81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins jolt-net
+`9dc88108299b8d15d9d31e1b65403bd356da3fbc`. `deps.edn` pins jolt-tcp at
+`0c3e085f43b90b346be9843e43448c890f8b701d`, which transitively pins jolt-net
 at `eabf9067f32d0f4c1673b5d84c24484943ea75c5`.
 
-Progress is also written to `/tmp/jolt-http-test-progress.log`; jolt block-buffers
-stdout when it is redirected, so on a hang that file is the only record of how
-far the run got.
+Progress is also written to the absolute
+`jolt-http-test-progress.log` path under `java.io.tmpdir`. Protocol-property
+entries include the exact test-var name. Jolt block-buffers stdout when it is
+redirected, so on a hang that file is the durable record of how far the run got.
+Because Jolt futures cannot currently cancel a running task, a watchdog timeout
+fails the gate and suppresses all later scenarios rather than letting the timed
+out task overlap them.
 
 ## License
 

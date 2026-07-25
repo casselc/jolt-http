@@ -24,11 +24,13 @@
             [jolt.http.body :as body]
             [jolt.http.date :as date]
             [jolt.http.fake-socket :as fs]
+            [jolt.http.hegel-support :as hegel-support]
             [jolt.http.http-model :as m]
             [teensyp.buffer :as buf]))
 
 (def ^:private opts
-  {:test-cases 200 :database "" :verbosity :quiet})
+  (hegel-support/run-opts
+   {:test-cases 200 :database "" :verbosity :quiet}))
 
 ;; --- date ------------------------------------------------------------------
 

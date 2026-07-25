@@ -20,9 +20,10 @@ changes are inherited. See
 
 The reviewed Jolt proposal fork is published only to `casselc/jolt` on
 `codex/upstream-improvements-6-8`; nothing has been pushed to the upstream
-project's origin and no pull request has been opened. Its current HTTP
-prerequisites include scoped array ranges at `1c8fdb97`, Windows path handling
-at `358c42b7`, and the variadic FFI boundary at `ecf7728f`. The known-unsound
+project's origin. Six stacked draft PRs exist inside the fork only; none targets
+upstream. Its current HTTP prerequisites include scoped array ranges at
+`1c8fdb97`, Windows path handling at `358c42b7`, the variadic FFI boundary at
+`ecf7728f`, and transactional Git dependency resolution at `9dc88108`. The known-unsound
 runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
 `21062d5b` and is not part of the proposal branch.
 
@@ -32,7 +33,7 @@ runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
   `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
   failure injection.
 - `deps.edn` pins jolt-tcp at
-  `81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins the
+  `0c3e085f43b90b346be9843e43448c890f8b701d`, which transitively pins the
   validated jolt-net revision. CI resolves this immutable graph directly rather
   than cloning mutable sibling branches.
 - Response writes use TCP's outcome-bearing completion API, so reset/failure
@@ -305,8 +306,9 @@ The reviewed fork now implements overlap-safe `System/arraycopy`, bulk native
 array transfers, whole-array borrowing, and scoped nonzero-offset byte-array
 borrowing. Commit `1c8fdb97eee58870b9fb9de928430d016c0cf06d` is the current
 byte-slice implementation; the current HTTP/transport baseline is its descendant
-`ecf7728f15d8b8f858327c47dbd8b751eb36798c`, which also rejects executor
-submissions after shutdown and preserves drive-rooted project paths on Windows.
+`9dc88108299b8d15d9d31e1b65403bd356da3fbc`, which also rejects executor
+submissions after shutdown, preserves drive-rooted project paths on Windows,
+and validates immutable Git dependency checkouts transactionally.
 `jolt.net` and jolt-tcp use those borrowed ranges
 for socket I/O, including partial sends whose next position is nonzero.
 Allocation and throughput measurement remains open.
