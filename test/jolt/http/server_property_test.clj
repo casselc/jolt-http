@@ -63,7 +63,21 @@
 ;; out-of-band `events` log, which is the only record of what happened in a run
 ;; that libhegel flagged as nondeterministic (those come back with no
 ;; counterexample at all).
-(defn- reporter [{:keys [type description result error] :as ev}]
+;; NOTE ON THE :error BRANCH. hegel.report/run! publishes a thrown setup,
+;; health-check or engine error under :exception. This reporter destructured
+;; :error, which is never present on that event, so every engine error printed
+;; a bare "nil" and the actual exception was discarded. That is how a real
+;; macOS x86-64 failure ("engine/setup error", 32 s) arrived with no
+;; diagnosable content at all. Read :exception, and print its message, ex-data
+;; and cause chain rather than relying on pr-str of an exception object.
+(defn- describe-exception [e]
+  (when e
+    (let [data (ex-data e)]
+      (cond-> {:message (ex-message e)}
+        (some? data) (assoc :ex-data data)
+        (some? (ex-cause e)) (assoc :cause (ex-message (ex-cause e)))))))
+
+(defn- reporter [{:keys [type description result exception] :as ev}]
   (case type
     :pass  (println "ok   " description (str "(" (:valid-test-cases result) " cases)"))
     :fail  (do (println "FAIL " description)
@@ -76,7 +90,10 @@
                (println "   observed:" (pr-str (frequencies (map first @events))))
                (println "   first:   " (pr-str (first @events))))
     :error (do (println "FAIL " description "(engine/setup error)")
-               (println "   " (pr-str error)))
+               (println "   exception:" (pr-str (describe-exception exception)))
+               (println "   raw:      " (pr-str exception))
+               (println "   observed: " (pr-str (frequencies (map first @events))))
+               (println "   first:    " (pr-str (first @events))))
     (println (pr-str ev)))
   (reset! events [])
   (flush))
