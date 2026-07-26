@@ -88,7 +88,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
+          ref: 85f645aa1178e4b631198dcbaf46bdad1283750b
           submodules: recursive
           path: jolt
 
@@ -126,14 +126,20 @@ jobs:
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test
 
-# Windows cannot run the loopback server groups until jolt.net has a Windows
-# readiness backend. Keep a native portable gate: source-build Chez, resolve the
-# exact Jolt/TCP/Hegel graph, load the production HTTP namespaces, and execute
-# the pure writer/date and in-process fake-transport protocol properties.
-  windows-portable:
-    name: portable HTTP gate (Windows x86_64; no socket runtime)
+# Windows x86-64 now runs the REAL loopback HTTP runtime, not a portable subset.
+# The pinned jolt-tcp W6A revision ships a reviewed Windows readiness backend and
+# public client, so the former "no socket runtime" caveat is obsolete and no
+# runtime or socket group is skipped on this target.
+#
+# Two lanes, deliberately: a dependency-free HTTP runtime gate that cannot be
+# disabled by a jolt-hegel resolution or install failure, and then the complete
+# Hegel-required suite. Both run through native PowerShell and invoke Chez
+# directly via the runtime's host\chez\cli.ss; neither routes execution through
+# bash. MSYS2 is present only to source-build Chez itself.
+  windows-runtime:
+    name: HTTP runtime suite (Windows x86_64; real loopback)
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         shell: msys2 {0}
@@ -194,27 +200,38 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
+          ref: 85f645aa1178e4b631198dcbaf46bdad1283750b
           submodules: recursive
           path: jolt
 
-      - name: Install libhegel
+      # Runs FIRST and declares no :extra-deps. Real Windows HTTP socket
+      # coverage must not be able to disappear because jolt-hegel failed to
+      # resolve or install, so this gate has to be able to pass on its own.
+      - name: Run dependency-free HTTP runtime contracts (real loopback)
+        shell: powershell
         env:
-          JOLT_PWD: ${{ github.workspace }}
-          JOLT_SH: 'C:/Program Files/Git/bin/sh.exe'
+          JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
         run: |
-          "$GITHUB_WORKSPACE/jolt/bin/joltc" -A:test -m hegel.install
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -JoltHttpPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -TestAlias '-M:windows-runtime-test' `
+            -TimeoutSeconds 900
 
-      - name: Run portable HTTP groups
+      - name: Install libhegel and run the complete test suite
+        shell: powershell
         env:
-          JOLT_PWD: ${{ github.workspace }}
-          JOLT_SH: 'C:/Program Files/Git/bin/sh.exe'
+          JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
         run: |
-          "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test \
-            "date formatting" \
-            "charset parsing" \
-            "pure properties" \
-            "protocol properties"
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -JoltHttpPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -TestAlias '-M:test' `
+            -InstallHegel `
+            -HegelRequired `
+            -TimeoutSeconds 2400
 
 # Windows ARM64 has no reviewed jolt.net descriptor yet. This public-preview
 # lane therefore runs only the explicit descriptor-independent HTTP tests and
@@ -251,57 +268,37 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 9dc88108299b8d15d9d31e1b65403bd356da3fbc
+          ref: 85f645aa1178e4b631198dcbaf46bdad1283750b
           submodules: recursive
           path: jolt
 
-      - name: Provide native Chez for source-mode Jolt
-        shell: bash
+      - name: Assert native ARM64 Chez for source-mode Jolt
+        shell: pwsh
         run: |
-          set -euo pipefail
-          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
-          scheme="$workspace/chez-arm64/tarm64nt/bin/tarm64nt/scheme.exe"
-          bindir="$workspace/.ci-windows-arm64-bin"
-          test -f "$scheme"
-          mkdir -p "$bindir"
-          printf '#!/bin/sh\nexec "%s" "$@"\n' "$scheme" > "$bindir/chez"
-          chmod +x "$bindir/chez"
-          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
-          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
-          cygpath -w "$bindir" >> "$GITHUB_PATH"
-          echo 'JOLT_SH=C:/Program Files/Git/bin/sh.exe' >> "$GITHUB_ENV"
-          echo 'JOLT_AOT_CACHE=0' >> "$GITHUB_ENV"
+          $scheme = Join-Path $env:GITHUB_WORKSPACE `
+            'chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe'
+          if (-not (Test-Path $scheme)) {
+            throw "native ARM64 Chez executable not found: $scheme"
+          }
+          $version = (& $scheme --version | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host $version
+          if (-not $version.Contains('10.4.1')) {
+            throw "expected Chez Scheme 10.4.1, got: $version"
+          }
 
-      - name: Run descriptor-independent HTTP tests
-        shell: bash
-        env:
-          JOLT_PWD: ${{ github.workspace }}
+      # One checked-in main covers both preview claims: the descriptor-independent
+      # HTTP tests actually run on native ARM64, AND jolt.net still fails closed
+      # with :unsupported-target before its reviewed ARM64 descriptor exists. It
+      # declares no jolt-hegel dependency, so W6A's Windows ARM64 jolt-hegel
+      # installer/Get-FileHash blocker cannot silence the fail-closed assertion.
+      # This lane is continue-on-error and claims NO socket-runtime support.
+      - name: Run the descriptor-independent HTTP preview (fail-closed transport)
+        shell: pwsh
         run: |
-          set -euo pipefail
-          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
-          "$workspace/jolt/bin/joltc" -A:test -m jolt.http.portable-test
-
-      - name: Require the unreviewed network target to fail closed
-        shell: bash
-        env:
-          JOLT_PWD: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
-          "$workspace/jolt/bin/joltc" - <<'EOF'
-          (require '[jolt.net.target :as target])
-          (let [observed (jolt.host/target)
-                error (try
-                        (target/descriptor observed)
-                        nil
-                        (catch Throwable cause cause))]
-            (when-not (= [:windows :aarch64 64]
-                         [(:os observed) (:arch observed) (:pointer-bits observed)])
-              (throw (ex-info "portable HTTP preview did not run on native Windows ARM64"
-                              {:target observed})))
-            (when-not (= :unsupported-target
-                         (:jolt.net/kind (ex-data error)))
-              (throw (ex-info "jolt.net did not fail closed before its ARM64 descriptor"
-                              {:target observed :error error})))
-            (println "PASS portable HTTP logic with network dependency fail-closed"))
-          EOF
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -JoltHttpPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
+            -TestAlias '-M:windows-arm64-preview' `
+            -TimeoutSeconds 600
