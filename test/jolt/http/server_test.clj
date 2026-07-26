@@ -1358,20 +1358,44 @@
 (defn- run-clojure-test-ns [ns-sym]
   (let [s (t/run-tests ns-sym)]
     (swap! failures + (+ (:fail s 0) (:error s 0)))
-    (swap! checks + (:pass s 0))))
+    (swap! checks + (:pass s 0))
+    s))
+
+;; Total generative tests/properties observed across every group this run. The
+;; per-group assertions below catch a group that runs but is empty; this catches
+;; the other direction — a generative scenario dropped from `scenarios`
+;; altogether, which no per-group check can see because it never executes.
+(def ^:private generative-observed (atom 0))
+
+(defn- run-generative-test-ns
+  "Run a clojure.test-hosted generative namespace and, under
+  JOLT_HEGEL_REQUIRED, refuse to accept a run that executed no tests."
+  [ns-sym label]
+  (let [s (run-clojure-test-ns ns-sym)
+        n (:test s 0)]
+    (swap! generative-observed + n)
+    (hegel-support/assert-generative-coverage! label n)
+    s))
 
 (defn- test-pure-properties []
-  (run-clojure-test-ns 'jolt.http.body-property-test))
+  (run-generative-test-ns 'jolt.http.body-property-test "pure properties"))
 
 (defn- test-protocol-properties []
   (with-property-progress
     'jolt.http.protocol-property-test
-    #(run-clojure-test-ns 'jolt.http.protocol-property-test)))
+    #(run-generative-test-ns 'jolt.http.protocol-property-test
+                             "protocol properties")))
 
 (defn- test-loopback-properties []
   (let [before (jolt.http.server-property-test/failure-count)]
     (jolt.http.server-property-test/run-properties!)
-    (swap! failures + (- (jolt.http.server-property-test/failure-count) before))))
+    (swap! failures + (- (jolt.http.server-property-test/failure-count) before))
+    ;; A zero failure count is not evidence of coverage — it is also what a
+    ;; group that never executed reports. Under JOLT_HEGEL_REQUIRED, refuse to
+    ;; call that a pass.
+    (let [n (jolt.http.server-property-test/run-count)]
+      (swap! generative-observed + n)
+      (hegel-support/assert-generative-coverage! "loopback properties" n))))
 
 ;; --- runner ----------------------------------------------------------------
 
@@ -1476,6 +1500,16 @@
                 (str (if (= :TIMEOUT outcome) "TIMEOUT " "END   ")
                      label "\n")
                 :append true)))))
+  ;; Whole-suite fail-closed. Only meaningful for an unfiltered run: asking for
+  ;; a single scenario by name is a deliberate narrowing, not a silently missing
+  ;; generative layer. Uses `args` rather than the `only` set above because that
+  ;; binding's scope ends with the doseq.
+  (when (empty? args)
+    (try
+      (hegel-support/assert-generative-coverage! "suite" @generative-observed)
+      (catch :default e
+        (swap! failures inc)
+        (println "FAIL" (ex-message e)))))
   (println (str "\n" @checks " checks, " @failures " failures"))
   (flush)
   ;; core.async holds non-daemon threads; the process will not exit on its own.

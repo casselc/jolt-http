@@ -183,8 +183,17 @@ jobs:
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" \
             -A:test -m hegel.install
 
+      # JOLT_HEGEL_REQUIRED matches the Windows lane's -HegelRequired. Installing
+      # libhegel is not the same as requiring it: the install step succeeding
+      # says nothing about whether any generative case then ran. A missing
+      # library already aborts the run at namespace load
+      # (:hegel.ffi/library-load-failed, non-zero exit), so what this flag adds
+      # is the case that cannot catch — a run that loads libhegel fine and then
+      # executes no properties at all. See hegel-support/required?.
       - name: Run tests
         shell: bash
+        env:
+          JOLT_HEGEL_REQUIRED: "1"
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test
 

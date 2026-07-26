@@ -102,6 +102,15 @@
 
 (defn failure-count [] (report/failure-count runner))
 
+(defn run-count
+  "How many property thunks this runner has actually executed.
+
+  Exposed so the suite can refuse to report success when JOLT_HEGEL_REQUIRED is
+  set but nothing generative ran. A zero failure count is not evidence of
+  coverage: it is also what a group that never executed reports."
+  []
+  (report/run-count runner))
+
 (defn- guarded
   "Run one complete property through the counting runner, and report its wall
   time. jolt block-buffers stdout when it is redirected, so without the flush in
