@@ -52,6 +52,15 @@ observed green across all six lanes — Linux x86-64, Linux aarch64, macOS arm64
 macOS x86-64, Windows x86-64 and the non-gating Windows ARM64 preview.
 Windows ARM64 is a preview lane only and claims no socket-runtime support.
 
+Every POSIX lane and the Windows x86-64 suite run with `JOLT_HEGEL_REQUIRED=1`.
+That flag is not what makes a missing libhegel fail — `hegel.ffi` loads the
+native library eagerly, so an absent library aborts at namespace load with
+`:hegel.ffi/library-load-failed` and a non-zero exit, which was verified
+directly. What the flag adds is refusal to report success for a run that loaded
+libhegel and then executed no generative cases, whether because a group ran
+empty or because a generative scenario was dropped entirely. Both directions
+were verified by forcing them; see `hegel-support/assert-generative-coverage!`.
+
 ## Finding 1 — the flaky backpressure witness is a jolt-tcp re-arm latency
 
 The witness carried into this task was:
@@ -275,25 +284,44 @@ supersedes in-flight runs.
 Observed: Windows ARM64 7m19s → 1m21s, Windows x86-64 9m12s → 2m32s, macOS
 x86-64 13m03s → ~4m; full-matrix wall clock ~13 min → ~3.5 min.
 
-## Windows ARM64 remains a non-gating preview
+## Windows ARM64 — preview observed, boundary unchanged
 
-No socket-runtime support is claimed on Windows ARM64, and nothing here weakens
-that. jolt.net still lacks its reviewed ARM64 descriptor, so loading the HTTP
-server graph would correctly fail before any socket call, and W6A recorded a
-jolt-hegel installer/`Get-FileHash` blocker on that target.
+The preview lane has now **passed on native Windows ARM64 hardware**, which it
+had not when this document was first written.
 
-The lane is `continue-on-error`, builds native `tarm64nt` Chez 10.4.1, and runs
-one checked-in main (`jolt.http.windows-arm64-preview`, alias
-`-M:windows-arm64-preview`) that covers both preview claims: the
-descriptor-independent HTTP layers really run on native ARM64, **and**
-`jolt.net.target/descriptor` still fails closed with `:unsupported-target`. It
-declares no jolt-hegel dependency, so the installer blocker cannot silence the
-fail-closed assertion. No packaged joltc, devboot, AOT cache, HTTP listener, or
-Winsock runtime claim is involved.
+Observed evidence:
 
-That namespace was exercised on Linux to confirm it loads and that its portable
-selection is non-vacuous (2 tests, 11 assertions) before correctly refusing the
-non-ARM64 target. The ARM64 lane itself remains unobserved on this revision.
+| item | value |
+| --- | --- |
+| run / job | `30216650356` / `89831928101` |
+| runner | `windows-11-vs2026-arm` |
+| Chez | native `tarm64nt` 10.4.1, restored from `chez-Windows-ARM64-v10.4.1-tarm64nt-v1` |
+| entry point | `-M:windows-arm64-preview` (`jolt.http.windows-arm64-preview`) |
+| result | `Ran 2 tests. 11 assertions passed, 0 failures, 0 errors.` |
+| fail-closed assertion | `PASS portable HTTP logic with network dependency fail-closed` |
+
+The `Get-FileHash` caveat is also obsolete here and has been removed rather than
+restated: W6A hit a jolt-hegel installer blocker on this target, but this lane
+declares no jolt-hegel dependency and never invokes the installer — the CI step
+does not pass `-InstallHegel` — so that blocker is not on its path at all.
+
+**The boundary is unchanged, and passing does not widen it.** What the lane
+proves is exactly two things: that the descriptor-independent HTTP layers really
+execute under native source-mode Jolt on ARM64, and that
+`jolt.net.target/descriptor` still fails closed with `:unsupported-target`. In
+particular this lane is and remains:
+
+- **non-gating** — `continue-on-error: true`;
+- **no socket runtime** — jolt.net still lacks a reviewed ARM64 descriptor, so
+  loading the HTTP/TCP server graph would correctly fail before any socket call.
+  No listener is started and no HTTP-over-Winsock support is claimed;
+- **no jolt-hegel dependency** — the alias declares no `:extra-deps`, so an
+  installer failure can never silence the fail-closed assertion;
+- **no packaged joltc, no devboot, no AOT cache claim** — it is source-mode Jolt
+  over a natively built `tarm64nt` Chez, with `JOLT_AOT_CACHE=0`.
+
+The same namespace was also exercised on Linux, where it runs the portable
+selection non-vacuously and then correctly refuses the non-ARM64 target.
 
 ## Proof boundary
 
