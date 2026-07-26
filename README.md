@@ -303,13 +303,22 @@ until they are observed green on this revision. Because libhegel 0.30.1
 publishes no Darwin/x86_64 asset, the Intel job builds its exact tagged source
 and supplies the resulting library explicitly.
 
-Windows x86_64 has a candidate native portable gate: it loads the production
-HTTP/TCP/net graph and runs date/charset cases plus the pure body and in-process
-fake-transport protocol properties, which exercise parser boundaries without
-opening a listener. It deliberately omits every
-real-loopback group. That job is a compile/load and portable-logic gate, not
-HTTP-over-Winsock support; full Windows runtime coverage waits for `jolt.net`'s
-Windows readiness backend.
+Windows x86_64 has observed native runtime evidence for the complete
+real-loopback suite. The pinned jolt-tcp revision ships a reviewed Windows
+readiness backend and public client, so the former portable-only caveat no
+longer applies and **no runtime or socket group is skipped on this target**.
+
+Two lanes run there. The first is a dependency-free HTTP runtime gate
+(`-M:windows-runtime-test`) that declares no `:extra-deps`, so real Windows
+socket coverage cannot disappear because jolt-hegel failed to resolve or
+install; it requires a port-zero listen, real request/response, keep-alive,
+pipelining, a request body large enough to force reader backpressure, a
+half-close that is still answered, and a deterministic stop. The second runs the
+complete `-M:test` suite with `JOLT_HEGEL_REQUIRED=1`. Both are driven from
+native PowerShell through `tools/test-windows-source.ps1`, which invokes Chez
+directly via the runtime's `host\chez\cli.ss` and never routes execution through
+bash. See [docs/runtime/windows-http-runtime.md](docs/runtime/windows-http-runtime.md)
+for the observed evidence and the pins it was taken against.
 
 Windows aarch64 has a separate non-gating public-preview lane on
 `windows-11-vs2026-arm`. It builds native `tarm64nt` Chez 10.4.1 and runs the
@@ -324,7 +333,7 @@ Runs a framework-less acceptance suite plus three generative layers
 sockets so that malformed requests, split requests and pipelining can be
 exercised exactly. Scenarios are ported from Capra's test suite. Acceptance
 scenarios run under a 60-second watchdog; the pure, in-process protocol, and
-loopback property groups have 180-, 300-, and 600-second bounds respectively.
+loopback property groups have 180-, 300-, and 960-second bounds respectively.
 The loopback client uses a blocking recv with no socket timeout, so a lost
 response would otherwise hang the run instead of failing it.
 
