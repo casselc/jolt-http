@@ -112,6 +112,52 @@
 
 ;; --- client ----------------------------------------------------------------
 
+(defn- connection-reset?
+  "True for the terminal signal a peer that closed with unread request bytes
+  still buffered delivers to this side.
+
+  jolt.net maps both ECONNRESET and EPIPE (and Windows' WSAECONNRESET, 10054)
+  onto the single :connection-reset kind, so one predicate covers every
+  platform's version of \"the peer is gone\"."
+  [e]
+  (= :connection-reset (:jolt.net/kind (ex-data e))))
+
+;; A reset is a legitimate terminal signal here, not a property failure, and it
+;; is far more likely on Windows than on POSIX. The oversize property is the
+;; clear case: the server answers 414/431 and closes while the rest of the
+;; oversized request is still in flight. POSIX loopback usually still lets the
+;; client observe a clean EOF; Windows delivers WSAECONNRESET to whichever call
+;; is in flight -- the remaining send, the half-close, or the read.
+;;
+;; jolt.http.server-test already encodes exactly this reasoning in its
+;; recv-until-eof ("the response bytes received before that terminal signal
+;; remain valid and must still be checked"); the property harness did not, so on
+;; native Windows the raised exception escaped `fail!` entirely and libhegel saw
+;; a case that threw once and passed on replay -- reported as a flaky test with
+;; no counterexample and an empty out-of-band event log.
+;;
+;; Swallowing the reset does NOT weaken any oracle. Every caller still has to
+;; satisfy its own `done?` over the bytes actually received; a reset that
+;; arrives before the expected response still fails the property, now as a
+;; specific "no-response"/"timeout" origin rather than as an unattributed throw.
+(defn- send-through!
+  "Send every chunk and half-close. Returns true normally, false once the peer
+  has reset -- there is nothing left to send to."
+  [fd chunks]
+  (try
+    (doseq [c chunks] (net/client-send-all fd (m/->ba c)))
+    (net/shutdown-write! fd)
+    true
+    (catch :default e
+      (if (connection-reset? e) false (throw e)))))
+
+(defn- recv-chunk!
+  "One bounded receive. Returns the bytes, or nil for EOF *or* a peer reset."
+  [fd n]
+  (try (net/client-recv fd n)
+       (catch :default e
+         (if (connection-reset? e) nil (throw e)))))
+
 (defn- recv-until-eof
   "Drain to a real EOF, bounded in time and bytes. Reaching either bound is a
   failure of the property, never a retry."
@@ -119,7 +165,7 @@
   (let [r (deref (future (loop [acc [] total 0]
                            (if (> total (long max-bytes))
                              :overrun
-                             (if-let [b (net/client-recv fd 16384)]
+                             (if-let [b (recv-chunk! fd 16384)]
                                (recur (conj acc b) (+ total (alength b)))
                                acc))))
                  timeout-ms :timeout)]
@@ -130,7 +176,18 @@
 
 (defn- read-into!
   "Accumulate bytes into `acc` until `done?` holds over its contents, or the
-  deadline passes. Returns true if `done?` was satisfied.
+  deadline passes.
+
+  Returns :done when `done?` was satisfied, :peer-closed when the peer ended
+  the connection (clean EOF or reset) with `done?` still unsatisfied, and
+  :timeout when the deadline expired with the connection still open.
+
+  Those last two used to be conflated as a single false, which made a
+  connection the server terminated in 79 ms indistinguishable from a server
+  that never answered inside 8 s. They are completely different observations:
+  one is a legal transport outcome for a request the server is entitled to
+  reject and close on, the other is a liveness failure. Only a caller that
+  knows which of the two its scenario permits can judge it.
 
   ONE future around the whole receive loop, deliberately. Wrapping each
   individual recv in its own short-timeout future looks equivalent and is not:
@@ -145,17 +202,17 @@
   condition has to come from the response framing itself."
   [fd acc done? timeout-ms]
   (if (done? @acc)
-    true
-    (boolean
-     (deref (future
-              (loop []
-                (if (done? @acc)
-                  true
-                  (if-let [b (net/client-recv fd 16384)]
-                    (do (swap! acc into (m/->octets b)) (recur))
-                    ;; EOF: nothing more is coming, so this is the final answer
-                    (done? @acc)))))
-            timeout-ms false))))
+    :done
+    (deref (future
+             (loop []
+               (if (done? @acc)
+                 :done
+                 (if-let [b (recv-chunk! fd 16384)]
+                   (do (swap! acc into (m/->octets b)) (recur))
+                   ;; EOF or peer reset: nothing more is coming, so what has
+                   ;; arrived is the final answer.
+                   (if (done? @acc) :done :peer-closed)))))
+           timeout-ms :timeout)))
 
 (defn- n-responses? [n heads]
   (fn [octets] (>= (count (:responses (m/read-responses octets heads))) n)))
@@ -175,13 +232,23 @@
    (let [fd  (net/connect-loopback port)
          acc (atom [])]
      (try
-       (doseq [c chunks] (net/client-send-all fd (m/->ba c)))
-       (net/shutdown-write! fd)
-       (if (read-into! fd acc done? timeout-ms) @acc :timeout)
+       (send-through! fd chunks)
+       (case (read-into! fd acc done? timeout-ms)
+         :done @acc
+         :peer-closed :peer-closed
+         :timeout :timeout)
        (finally (net/close! fd))))))
 
-(defn- check-drain! [origin got data]
+(defn- check-drain!
+  "Fail unless `got` is real response bytes.
+
+  :peer-closed is a failure by default and only by default: a scenario in which
+  the server is entitled to terminate the connection instead of answering must
+  say so explicitly at its own call site, so that permission is never granted
+  silently to a property that did not intend it."
+  [origin got data]
   (when (= got :timeout) (fail! (str origin "/timeout") data))
+  (when (= got :peer-closed) (fail! (str origin "/peer-closed") data))
   (when (= got :overrun) (fail! (str origin "/overrun") data))
   got)
 
@@ -312,6 +379,41 @@
 
 ;; --- 3. request bodies large enough to exercise backpressure ---------------
 
+;; This property's observer bound is deliberately not the shared 8 s default.
+;;
+;; The fixture below (1 KB read buffer, stream queue of 2, bodies up to 120 KB)
+;; drives up to ~118 reactor read cycles per case, which is an order of
+;; magnitude more than any other property here. On POSIX each of those cycles is
+;; exposed to a jolt-tcp reactor re-arm latency: when a handler arity completes
+;; in the window after the reactor has drained its pending set but before it
+;; re-enters `net/await-ready`, the connection is only re-serviced on the next
+;; tick of that wait, which jolt-tcp fixes at 1000 ms. The observed response
+;; latency for one case is therefore (real work) + k x 1000 ms.
+;;
+;; That was measured, not assumed, and the raw evidence is recorded in
+;; docs/runtime/windows-http-runtime.md:
+;;
+;;   - Linux, this exact fixture, 15 consecutive 93388-byte exchanges under a
+;;     120 s watchdog: every one delivered the body whole and correct, with
+;;     latencies of 183/2188/2216/3222/4219/4245/4246/4248/6228/6234/6251/
+;;     7245/7301/8257/8296 ms -- a base cost plus a whole number of 1 s steps,
+;;     and ZERO wedges.
+;;   - The same stall reproduces with jolt-tcp alone and no HTTP layer, and
+;;     disappears when the read buffer is widened (fewer cycles), which places
+;;     it below this repository.
+;;   - It is not observed on native Windows x86-64 at all.
+;;
+;; So the 8 s bound was not measuring liveness, it was sampling the tail of a
+;; lower-layer latency distribution -- which is exactly why it produced a
+;; libhegel "flaky" classification (seed 9157075391771664454, case
+;; {:size 93388, :framing :content-length}) rather than a reproducible failure.
+;; The bound below is sized at ~5x the worst latency observed across many runs.
+;; It is a LIVENESS bound: progress is bounded and every byte still has to
+;; arrive intact, so a case that exhausts it has genuinely stopped, and that is
+;; still a failure. Widening the buffers to dodge the latency instead would
+;; delete the backpressure coverage this property exists for.
+(def ^:private backpressure-timeout-ms 45000)
+
 (defn- prop-request-body-backpressure []
   (with-server {:handler digest-handler :read-buffer-size 1024 :stream-queue-size 2}
     (fn [port]
@@ -334,7 +436,8 @@
                                                :body-framing (if (= framing :chunked)
                                                                [:chunked sizes]
                                                                :content-length)})
-                    got     (exchange port [raw])]
+                    got     (exchange port [raw] (n-responses? 1 nil)
+                                      backpressure-timeout-ms)]
                 (h/fprn :body-size n :framing framing)
                 (check-drain! "server/request-backpressure" got {:size n :framing framing})
                 (let [{:keys [responses error]} (m/read-responses got)]
@@ -429,17 +532,21 @@
                   ;; The client must not send the body until it has permission;
                   ;; without the interim response it stalls until its own
                   ;; timeout (curl does this for bodies over 1KB).
-                  (when-not (read-into! fd acc
-                                        (fn [o] (seq (:responses (m/read-responses o))))
-                                        4000)
-                    (fail! "server/expect-continue/no-interim" {:size (count payload)}))
+                  (let [outcome (read-into! fd acc
+                                            (fn [o] (seq (:responses (m/read-responses o))))
+                                            4000)]
+                    (when-not (= :done outcome)
+                      (fail! "server/expect-continue/no-interim"
+                             {:size (count payload) :outcome outcome})))
                   (let [interim (first (:responses (m/read-responses @acc)))]
                     (when-not (= 100 (:status interim))
                       (fail! "server/expect-continue/not-100" {:status (:status interim)})))
                   (net/client-send-all fd (m/->ba payload))
                   (net/shutdown-write! fd)
-                  (when-not (read-into! fd acc (n-responses? 2 nil) 8000)
-                    (fail! "server/expect-continue/no-final" {:size (count payload)}))
+                  (let [outcome (read-into! fd acc (n-responses? 2 nil) 8000)]
+                    (when-not (= :done outcome)
+                      (fail! "server/expect-continue/no-final"
+                             {:size (count payload) :outcome outcome})))
                   (let [final (second (:responses (m/read-responses @acc)))]
                     (h/fprn :size (count payload))
                     (when-not (= payload (read-string (m/body-str final)))
@@ -478,16 +585,41 @@
                                   :else       431)
                       got   (exchange port [(m/ascii raw)])]
                   (h/fprn :pad-len pad-len :in-uri? in-uri? :raw-len (count raw) :over? over?)
-                  (check-drain! "server/oversize" got {:pad-len pad-len :over? over?})
-                  (let [{:keys [responses error]} (m/read-responses got)]
-                    (when error
-                      (fail! "server/oversize/malformed" {:error error :pad-len pad-len}))
-                    (when (empty? responses)
-                      (fail! "server/oversize/no-response" {:pad-len pad-len :raw-len (count raw)}))
-                    (when-not (= want (:status (first responses)))
-                      (fail! "server/oversize/status"
-                             {:want want :got (:status (first responses))
-                              :raw-len (count raw) :over? over? :in-uri? in-uri?})))))))))))))
+                  ;; An over-limit request is the one case in this suite where
+                  ;; the server legitimately rejects and closes while the rest
+                  ;; of the request is still in flight. TCP then answers the
+                  ;; unread inbound data with a RST, and a RST discards whatever
+                  ;; is still sitting unread in the client's receive queue --
+                  ;; including, sometimes, the 414/431 the server did send.
+                  ;;
+                  ;; That is a transport fact, not an HTTP conformance fact, and
+                  ;; it is timing-dependent: native Windows x86-64 hits it
+                  ;; intermittently (seed 305835134111915440, pad-len 2048),
+                  ;; POSIX loopback almost never does. jolt.http.server-test's
+                  ;; recv-until-eof already encodes exactly this reasoning for
+                  ;; the acceptance scenario; the property harness did not, so
+                  ;; the case surfaced as a libhegel "flaky" verdict.
+                  ;;
+                  ;; Permit it here, and ONLY here, and only for over? cases --
+                  ;; an under-limit request is answered on a connection the
+                  ;; server keeps open, so it has no reset race and must always
+                  ;; produce its 200. Every other oracle is untouched: if a
+                  ;; response does arrive it must still be well-formed and carry
+                  ;; exactly the expected status.
+                  (if (and over? (= got :peer-closed))
+                    (h/fprn :oversize-terminated-without-response true)
+                    (do
+                      (check-drain! "server/oversize" got
+                                    {:pad-len pad-len :over? over?})
+                      (let [{:keys [responses error]} (m/read-responses got)]
+                        (when error
+                          (fail! "server/oversize/malformed" {:error error :pad-len pad-len}))
+                        (when (empty? responses)
+                          (fail! "server/oversize/no-response" {:pad-len pad-len :raw-len (count raw)}))
+                        (when-not (= want (:status (first responses)))
+                          (fail! "server/oversize/status"
+                                 {:want want :got (:status (first responses))
+                                  :raw-len (count raw) :over? over? :in-uri? in-uri?})))))))))))))))
 
 ;; --- 8. stateful connection model over real transport ----------------------
 
@@ -563,7 +695,7 @@
                             (fn [{:keys [fd acc pending drained] :as state}]
                               (let [want  (count drained)
                                     heads (map :head? (concat drained pending))]
-                                (when-not (read-into! fd acc (n-responses? (inc want) heads) 15000)
+                                (when-not (= :done (read-into! fd acc (n-responses? (inc want) heads) 15000))
                                   (fail! "server/stateful/missing-response"
                                          {:expected (inc want)
                                           :got (count (:responses (m/read-responses @acc heads)))}))

@@ -1310,10 +1310,29 @@
 ;; --- generative layers -----------------------------------------------------
 
 (def ^:private progress-file
-  (.getAbsolutePath
-   (java.io.File.
-    (or (System/getProperty "java.io.tmpdir") ".")
-    "jolt-http-test-progress.log")))
+  ;; jolt's java.io.File does not recognise a drive-qualified Windows path as
+  ;; absolute, and it joins with "/". On native Windows
+  ;; (.getAbsolutePath (java.io.File. "C:\\Users\\...\\Temp" name)) therefore
+  ;; prepends the process working directory and yields
+  ;; "D:\...\runtime/C:\Users\...\Temp/jolt-http-test-progress.log", which
+  ;; open-output-file rejects with "invalid argument". The native Windows gate
+  ;; deliberately runs with the process cwd set to the runtime checkout, so this
+  ;; is hit on every native run and aborts the suite before its first scenario.
+  ;;
+  ;; Join the directory ourselves whenever it is already absolute, and keep the
+  ;; java.io.File path only for a genuinely relative fallback. The location is
+  ;; also overridable so a sandboxed runner can redirect it.
+  (let [dir (or (System/getenv "JOLT_HTTP_TEST_TMPDIR")
+                (System/getProperty "java.io.tmpdir")
+                ".")
+        filename "jolt-http-test-progress.log"
+        windows-absolute? (some? (re-find #"^[A-Za-z]:[\\/]" dir))
+        posix-absolute? (str/starts-with? dir "/")]
+    (if (or windows-absolute? posix-absolute?)
+      (str (str/replace dir #"[\\/]+$" "")
+           (if windows-absolute? "\\" "/")
+           filename)
+      (.getAbsolutePath (java.io.File. dir filename)))))
 
 (defn- reset-progress! []
   ;; Core's atomic spit contract replaces an existing destination on every
@@ -1437,7 +1456,13 @@
    ;; from scratch.
    ["pure properties"      test-pure-properties      180000]
    ["protocol properties"  test-protocol-properties  300000]
-   ["loopback properties"  test-loopback-properties  600000]])
+   ;; The loopback watchdog must stay above the sum of the per-case bounds its
+   ;; slowest property can spend. server/request-backpressure allows 45 s per
+   ;; case over 20 cases (see backpressure-timeout-ms and the measurements it
+   ;; cites), so a 600 s outer bound could expire before the property itself
+   ;; reported anything — turning a diagnosable per-case failure into an opaque
+   ;; scenario timeout.
+   ["loopback properties"  test-loopback-properties  960000]])
 
 (defn -main [& args]
   (let [only       (set args)
