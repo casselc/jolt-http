@@ -295,13 +295,18 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -A:test -m hegel.install
 JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -M:test
 ```
 
-Linux x86_64 and macOS arm64 have observed native runtime evidence for the
-complete real-loopback suite with source-built Chez 10.4.1. Equivalent
-full-runtime jobs are configured for Linux aarch64 (`ubuntu-24.04-arm`) and
-macOS x86_64 (`macos-15-intel`); treat those new rows as candidate coverage
-until they are observed green on this revision. Because libhegel 0.30.1
-publishes no Darwin/x86_64 asset, the Intel job builds its exact tagged source
-and supplies the resulting library explicitly.
+Linux x86_64, Linux aarch64 (`ubuntu-24.04-arm`), macOS arm64 and macOS x86_64
+(`macos-15-intel`) all have observed native runtime evidence for the complete
+real-loopback suite with source-built Chez 10.4.1 — these are no longer
+candidate rows. Because libhegel 0.30.1 publishes no Darwin/x86_64 asset, the
+Intel job builds its exact tagged source and supplies the resulting library
+explicitly.
+
+Every POSIX lane runs with `JOLT_HEGEL_REQUIRED=1`, matching the Windows lane.
+Installing libhegel is not the same as requiring it: a missing library already
+aborts the run at namespace load, but the flag additionally refuses to report
+success for a run that loaded libhegel and then executed no generative cases at
+all.
 
 Windows x86_64 has observed native runtime evidence for the complete
 real-loopback suite. The pinned jolt-tcp revision ships a reviewed Windows
@@ -355,12 +360,15 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
 ```
 
 The current reviewed core baseline is
-`9dc88108299b8d15d9d31e1b65403bd356da3fbc`. `deps.edn` pins jolt-tcp at
-`0c3e085f43b90b346be9843e43448c890f8b701d`, which transitively pins jolt-net
-at `eabf9067f32d0f4c1673b5d84c24484943ea75c5`.
+`85f645aa1178e4b631198dcbaf46bdad1283750b`. `deps.edn` pins jolt-tcp at
+`6a311ea8242c867f906ce164bd39d7f33a499a3f`, which transitively pins jolt-net
+at `a4a4deb6b757d5e86aeb941cf646927e21420df6`.
 
 Progress is also written to the absolute
-`jolt-http-test-progress.log` path under `java.io.tmpdir`. Protocol-property
+`jolt-http-test-progress.log` path under the platform temp directory
+(overridable with `JOLT_HTTP_TEST_TMPDIR`; see `hegel-support/temp-path`, which
+exists because a drive-qualified Windows path is not absolute to jolt's
+`java.io.File`). Protocol-property
 entries include the exact test-var name. Jolt block-buffers stdout when it is
 redirected, so on a hang that file is the durable record of how far the run got.
 Because Jolt futures cannot currently cancel a running task, a watchdog timeout

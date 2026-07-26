@@ -23,7 +23,9 @@ The reviewed Jolt proposal fork is published only to `casselc/jolt` on
 project's origin. Six stacked draft PRs exist inside the fork only; none targets
 upstream. Its current HTTP prerequisites include scoped array ranges at
 `1c8fdb97`, Windows path handling at `358c42b7`, the variadic FFI boundary at
-`ecf7728f`, and transactional Git dependency resolution at `9dc88108`. The known-unsound
+`ecf7728f`, and transactional Git dependency resolution at `9dc88108` (carried
+forward into the current reviewed core baseline
+`85f645aa1178e4b631198dcbaf46bdad1283750b`). The known-unsound
 runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
 `21062d5b` and is not part of the proposal branch.
 
@@ -33,9 +35,12 @@ runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
   `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
   failure injection.
 - `deps.edn` pins jolt-tcp at
-  `0c3e085f43b90b346be9843e43448c890f8b701d`, which transitively pins the
-  validated jolt-net revision. CI resolves this immutable graph directly rather
-  than cloning mutable sibling branches.
+  `6a311ea8242c867f906ce164bd39d7f33a499a3f`, which transitively pins the
+  validated jolt-net revision `a4a4deb6b757d5e86aeb941cf646927e21420df6`. CI
+  resolves this immutable graph directly rather than cloning mutable sibling
+  branches. (The 2026-07-24 entry below was written against jolt-tcp
+  `0c3e085f`; the W6B repin to the reviewed W6A runtime is what promoted
+  Windows x86-64 from portable-only to real socket coverage.)
 - Response writes use TCP's outcome-bearing completion API, so reset/failure
   paths unblock blocking producers and preserve the first native failure as a
   direct exception or closed-socket cause.
@@ -305,10 +310,12 @@ and driven by measured needs.
 The reviewed fork now implements overlap-safe `System/arraycopy`, bulk native
 array transfers, whole-array borrowing, and scoped nonzero-offset byte-array
 borrowing. Commit `1c8fdb97eee58870b9fb9de928430d016c0cf06d` is the current
-byte-slice implementation; the current HTTP/transport baseline is its descendant
-`9dc88108299b8d15d9d31e1b65403bd356da3fbc`, which also rejects executor
-submissions after shutdown, preserves drive-rooted project paths on Windows,
-and validates immutable Git dependency checkouts transactionally.
+byte-slice implementation. `9dc88108299b8d15d9d31e1b65403bd356da3fbc` is its
+descendant that also rejects executor submissions after shutdown, preserves
+drive-rooted project paths on Windows, and validates immutable Git dependency
+checkouts transactionally; the current HTTP/transport baseline is in turn its
+descendant `85f645aa1178e4b631198dcbaf46bdad1283750b`, which every CI and
+runtime checkout pins.
 `jolt.net` and jolt-tcp use those borrowed ranges
 for socket I/O, including partial sends whose next position is nonzero.
 Allocation and throughput measurement remains open.
@@ -417,12 +424,27 @@ and socket edge cases live in one audited implementation.
 ### Local implementation status
 
 `jolt.net` now owns endpoints, resolution, sockets, readiness registration,
-wakeup, structured native errors, and handle generations on Linux and macOS.
-jolt-tcp is implemented over that public surface and exposes actual local/peer
-endpoint maps through `socket-info`; jolt-http derives `:server-port`,
-`:server-name`, and `:remote-addr` there without importing `jolt.net` or
-`jolt.ffi`. Windows readiness and the portable connector/deadline and broader
-stream SPIs remain follow-up work.
+wakeup, structured native errors, and handle generations on Linux, macOS **and
+Windows x86-64**. jolt-tcp is implemented over that public surface and exposes
+actual local/peer endpoint maps through `socket-info`; jolt-http derives
+`:server-port`, `:server-name`, and `:remote-addr` there without importing
+`jolt.net` or `jolt.ffi`.
+
+Windows readiness is no longer follow-up work. The pinned jolt-tcp W6A revision
+(`6a311ea8`) ships a reviewed Windows readiness backend and public client over
+jolt-net `a4a4deb6`, and jolt-http's Windows x86-64 lane now runs the complete
+real-loopback suite rather than a portable subset — the same 55 scenarios it
+runs on Linux, with no runtime or socket group skipped. See
+[runtime/windows-http-runtime.md](runtime/windows-http-runtime.md) for the
+observed evidence.
+
+Two caveats remain, and neither is a Windows readiness gap:
+
+- Windows **ARM64** has no reviewed `jolt.net` descriptor, so its lane is a
+  non-gating preview that runs only descriptor-independent HTTP logic and
+  asserts the transport still fails closed with `:unsupported-target`.
+- The portable connector/deadline and broader stream SPIs are still follow-up
+  work on every platform.
 
 ## 8. Expose a complete target descriptor
 
@@ -449,7 +471,16 @@ CPU count is an input, not the complete policy.
 Jolt proposal commits `3105198a` and `34fabb2c` expose the zero-argument
 `jolt.host/target` and replace fuzzy inference with an exact Chez machine-type
 allowlist. The expanded focused suite passes 33/33 checks on Linux with
-`scheme`; Windows x86_64 and macOS arm64 still need native validation.
+`scheme`.
+
+Windows x86-64 and macOS arm64 no longer "still need native validation": both
+are validated natively. `jolt.host/target` is asserted against the real target
+by this repository's Windows gates — `jolt.http.windows-runtime-test` refuses
+to run unless it observes `[:windows :x86-64 64]`, and the ARM64 preview
+refuses unless it observes `[:windows :aarch64 64]` — and macOS arm64 runs the
+full hosted suite. The remaining unvalidated target is Windows ARM64's
+`jolt.net` descriptor, which is deliberately absent and asserted fail-closed
+rather than inferred.
 
 ## 9. Add richer buffers and charset codecs only after the substrate
 
