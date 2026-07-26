@@ -431,6 +431,31 @@
 ;; delete the backpressure coverage this property exists for.
 (def ^:private backpressure-timeout-ms 45000)
 
+;; ...but the per-case bound above is NOT the binding constraint, and sizing it
+;; alone was not enough. libhegel applies its own aggregate TooSlow health check
+;; to the whole property, and that is what actually failed on macOS x86-64:
+;;
+;;   FailedHealthCheck: TooSlow — input generation is slow: only 8 valid inputs
+;;   after 38.082074097s (threshold 30s).
+;;
+;; The threshold is 30 s for the ENTIRE run, so a 45 s per-case bound could
+;; never be reached: the engine aborts the property first. Observed durations on
+;; macOS x86-64 make the race plain -- 15.2 s, 16.3 s, 26.4 s, 26.5 s, 27.4 s
+;; and 31.8 s all passed, 32.4 s failed. Same jolt-tcp re-arm latency documented
+;; above, on the slowest hosted runner.
+;;
+;; Suppressing TooSlow is what the check itself recommends for an expected cost,
+;; and it is sound for this property specifically: the generators are a bounded
+;; integer and a keyword, so input *generation* is trivial. The elapsed time is
+;; the property body pushing up to 120 KB through a deliberately undersized
+;; buffer over real loopback TCP -- which is the coverage, not a smell.
+;; Suppression is scoped to this one property; every other property keeps the
+;; check, so a genuine generation slowdown elsewhere still fails.
+;;
+;; It does not weaken the oracle: correctness is still asserted per case, and
+;; liveness is still bounded by backpressure-timeout-ms above.
+(def ^:private backpressure-health-checks #{:too-slow})
+
 (defn- prop-request-body-backpressure []
   (with-server {:handler digest-handler :read-buffer-size 1024 :stream-queue-size 2}
     (fn [port]
@@ -438,7 +463,8 @@
        "a large request body is delivered whole under backpressure"
        (fn []
          (h/run-test!
-          (assoc run-opts :test-cases 20 :name "server/request-backpressure")
+          (assoc run-opts :test-cases 20 :name "server/request-backpressure"
+                 :suppress-health-checks backpressure-health-checks)
           (fn [_]
             ;; A small read buffer and a short stream queue mean the parser's
             ;; blocking channel put parks, the socket stays WORKING and the
