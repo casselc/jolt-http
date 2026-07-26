@@ -44,6 +44,14 @@ poller really opens on the target.
 The dependency-free gate reports the same 68 assertions on Linux and on native
 Windows, so the two platforms are running the same contracts.
 
+The full suite runs the same 55 scenarios on Windows x86-64 as on Linux, so no
+runtime or socket group is skipped on that target.
+
+Hosted CI on this branch (`casselc/jolt-http`, workflow `tests`) has been
+observed green across all six lanes — Linux x86-64, Linux aarch64, macOS arm64,
+macOS x86-64, Windows x86-64 and the non-gating Windows ARM64 preview.
+Windows ARM64 is a preview lane only and claims no socket-runtime support.
+
 ## Finding 1 — the flaky backpressure witness is a jolt-tcp re-arm latency
 
 The witness carried into this task was:
@@ -128,6 +136,48 @@ so the outer bound stays above the sum of the per-case bounds its slowest
 property can spend; otherwise a diagnosable per-case failure would surface as an
 opaque scenario timeout.
 
+### The per-case bound was not the binding constraint
+
+Sizing that bound was necessary but **not sufficient**, and treating it as the
+whole fix was wrong. The macOS x86-64 lane — the slowest hosted runner, and one
+this branch had not measured when the 45 s bound was chosen — then failed
+intermittently with an opaque `engine/setup error`.
+
+Two things had to be fixed to see why:
+
+1. `hegel.report/run!` publishes a thrown setup, health-check or engine error
+   under `:exception`, but this suite's reporter destructured `:error` — a key
+   never present on that event. Every engine error had therefore always printed
+   a bare `nil` and discarded the exception.
+
+2. With that corrected, the cause is exact:
+
+   ```
+   FailedHealthCheck: TooSlow — input generation is slow: only 8 valid inputs
+   after 38.082074097s (threshold 30s).
+   ```
+
+libhegel applies a **30 s aggregate budget to the whole property**. A 45 s
+per-case bound can never be reached, because the engine aborts the property
+first. Observed durations on macOS x86-64 make the race plain:
+
+| duration | outcome |
+| --- | --- |
+| 15.2 s, 16.3 s, 26.4 s, 26.5 s, 27.4 s, 31.8 s | pass |
+| 32.4 s | TooSlow |
+
+Same jolt-tcp re-arm latency, just on slower hardware. `:too-slow` is therefore
+suppressed for this one property, which is what the check itself recommends for
+an expected cost. It is sound here specifically: the generators are a bounded
+integer and a keyword, so input *generation* is trivial; the elapsed time is the
+property body pushing up to 120 KB through a deliberately undersized buffer over
+real loopback TCP, which is the coverage. Every other property keeps the check,
+so a genuine generation slowdown elsewhere still fails.
+
+Verified by forcing the failure rather than waiting for it: with a 2.5 s
+artificial delay per case the property reliably tripped TooSlow at ~38 s; with
+the suppression it runs 68.4 s and passes, every case still checked.
+
 ## Finding 2 — an over-limit rejection can be RST'd on Windows
 
 Native Windows surfaced a second, unrelated flake in
@@ -164,9 +214,13 @@ Two test-layer changes, both in `test/`:
 No oracle was weakened: a response that does arrive must still be well-formed
 and carry exactly the expected status.
 
-## Finding 3 — the progress file was not Windows-path-safe
+## Finding 3 — two POSIX-only temp paths
 
-The suite aborted before its first scenario on native Windows:
+Both are test-layer portability defects, and the second is a reminder that a
+local Windows box is not the same target as a hosted Windows runner.
+
+**The progress file.** The suite aborted before its first scenario on native
+Windows:
 
 ```
 Exception in open-output-file: failed for
@@ -177,9 +231,49 @@ D:\src\jolt-proposal-net-runtime-w3/C:\Users\...\Temp/jolt-http-test-progress.lo
 jolt's `java.io.File` does not recognise a drive-qualified Windows path as
 absolute and joins with `/`, so `.getAbsolutePath` prepended the process working
 directory — which the native gate deliberately sets to the runtime checkout.
-`progress-file` now joins the directory itself when it is already absolute
-(POSIX or drive-qualified), keeps the `java.io.File` path only for a genuinely
-relative fallback, and accepts a `JOLT_HTTP_TEST_TMPDIR` override.
+
+**The file-writer property.** A hard-coded `"/tmp/jolt-http-prop-*.bin"` passed
+on the local Windows host, where a `\tmp` happens to exist on the current drive,
+and failed only on the hosted runner:
+
+```
+failed for /tmp/jolt-http-prop-0-1.bin: no such file or directory
+```
+
+so `body/file-writer` reported a missing file rather than testing the writer.
+
+Both now go through one helper, `hegel-support/temp-path`, rather than
+open-coding the rule twice: use the platform temp directory, join it ourselves
+when it is already absolute, keep the `java.io.File` path only for a genuinely
+relative fallback, and honour a `JOLT_HTTP_TEST_TMPDIR` override. The override
+was confirmed to be on the path by pointing it at a nonexistent directory and
+observing the suite fail there.
+
+## CI toolchain caching
+
+Not a correctness finding, but it dominated iteration time and is recorded so
+the trap is not reintroduced.
+
+`actions/cache` writes its cache in a post-job step, and that step is **skipped
+when the job fails**. The Windows x86-64 lane was red while the defects above
+were being fixed, so it could never populate its own cache: it rebuilt Chez from
+source (6m46s) on every attempt in order to run a ~90 s suite. The Windows ARM64
+preview had no cache at all (~7 min of `build.bat` per run), and with no
+`concurrency` group, stacked pushes produced concurrent runs that each missed
+the cache the others were about to write — macOS x86-64 rebuilt Chez for 9m28s
+in one run despite the preceding run having just cached it.
+
+Every toolchain cache is now `actions/cache/restore` plus an explicit
+`actions/cache/save` placed **after the build is asserted good and before any
+test step**, so a red or cancelled run can no longer cost the next one a
+rebuild, and what is saved has always passed its version assertion. The ARM64
+lane caches its `tarm64nt` tree, the macOS x86-64 libhegel build is cached on
+the pinned `hegel-rust` commit and toolchain, and a
+`tests-${{ github.ref }}` concurrency group with `cancel-in-progress`
+supersedes in-flight runs.
+
+Observed: Windows ARM64 7m19s → 1m21s, Windows x86-64 9m12s → 2m32s, macOS
+x86-64 13m03s → ~4m; full-matrix wall clock ~13 min → ~3.5 min.
 
 ## Windows ARM64 remains a non-gating preview
 
