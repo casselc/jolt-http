@@ -2,6 +2,15 @@ name: tests
 
 on: [push, pull_request, workflow_dispatch]
 
+# Supersede an in-flight run for the same ref. Without this, pushing twice in
+# quick succession leaves both runs racing: every toolchain cache is written at
+# the END of a job, so concurrent runs all miss the cache the others are about
+# to populate and each rebuilds Chez from source. That cost 9m28s on macOS
+# x86_64 alone in one observed run, for a commit that was already superseded.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: POSIX runtime suite (${{ matrix.name }})
@@ -32,10 +41,20 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install lz4 openssl@3
 
-      - name: Cache Chez Scheme (Linux)
+      # restore/save rather than actions/cache, deliberately. actions/cache only
+      # writes its cache in a post-job step, which is SKIPPED when the job
+      # fails — so a lane whose tests are red can never populate its toolchain
+      # cache and rebuilds Chez from source on every iteration. That is exactly
+      # what happened on Windows x86_64: 6m46s of Chez rebuild per run, for a
+      # ~90s test suite, on every attempt until the suite went green.
+      #
+      # The matching save steps run immediately after Chez is asserted good and
+      # BEFORE any test step, so the cache is populated by a validated build and
+      # a test failure cannot suppress it.
+      - name: Restore Chez Scheme (Linux)
         if: runner.os == 'Linux'
         id: cache-chez-linux
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/chez
           key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
@@ -52,10 +71,10 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: Cache Chez Scheme (macOS)
+      - name: Restore Chez Scheme (macOS)
         if: runner.os == 'macOS'
         id: cache-chez-macos
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/chez
           key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
@@ -84,6 +103,22 @@ jobs:
           "$bindir/chez" --version | tee /tmp/chez-version
           grep -Fq '10.4.1' /tmp/chez-version
 
+      # Saved here, not in a post-job step: Chez has just been asserted good and
+      # no test has run yet, so a red suite cannot cost the next run a rebuild.
+      - name: Save Chez Scheme (Linux)
+        if: runner.os == 'Linux' && steps.cache-chez-linux.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/chez
+          key: ${{ steps.cache-chez-linux.outputs.cache-primary-key }}
+
+      - name: Save Chez Scheme (macOS)
+        if: runner.os == 'macOS' && steps.cache-chez-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/chez
+          key: ${{ steps.cache-chez-macos.outputs.cache-primary-key }}
+
       - name: Checkout pinned Jolt fork
         uses: actions/checkout@v4
         with:
@@ -94,8 +129,19 @@ jobs:
 
       # libhegel 0.30.1 has no Darwin/x86_64 release asset. Build the exact
       # tagged source so Intel macOS still runs every HTTP property group.
-      - name: Checkout pinned libhegel source (macOS x86_64)
+      # Only the built dylib is cached, keyed on the exact hegel-rust commit and
+      # Rust toolchain, so a hit skips the clone, the rustup install and the
+      # cargo build alike. Nothing else on this lane depends on the source tree.
+      - name: Restore built libhegel (macOS x86_64)
         if: runner.os == 'macOS' && runner.arch == 'X64'
+        id: cache-libhegel-macos
+        uses: actions/cache/restore@v4
+        with:
+          path: hegel-build
+          key: libhegel-macOS-X64-0.30.1-f81c6cce-rust1.86.0-v1
+
+      - name: Checkout pinned libhegel source (macOS x86_64)
+        if: runner.os == 'macOS' && runner.arch == 'X64' && steps.cache-libhegel-macos.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: hegeldev/hegel-rust
@@ -104,14 +150,30 @@ jobs:
           path: hegel-rust
 
       - name: Build pinned libhegel 0.30.1 (macOS x86_64)
-        if: runner.os == 'macOS' && runner.arch == 'X64'
-        working-directory: hegel-rust
+        if: runner.os == 'macOS' && runner.arch == 'X64' && steps.cache-libhegel-macos.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
+          cd hegel-rust
           rustup toolchain install 1.86.0 --profile minimal
           cargo +1.86.0 build --locked -p hegeltest-c --release
-          library="$PWD/target/release/libhegel_c.dylib"
+          test -f target/release/libhegel_c.dylib
+          mkdir -p "$GITHUB_WORKSPACE/hegel-build"
+          cp target/release/libhegel_c.dylib "$GITHUB_WORKSPACE/hegel-build/"
+
+      - name: Save built libhegel (macOS x86_64)
+        if: runner.os == 'macOS' && runner.arch == 'X64' && steps.cache-libhegel-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: hegel-build
+          key: ${{ steps.cache-libhegel-macos.outputs.cache-primary-key }}
+
+      - name: Publish libhegel path (macOS x86_64)
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          library="$GITHUB_WORKSPACE/hegel-build/libhegel_c.dylib"
           test -f "$library"
           echo "HEGEL_LIBHEGEL_LIBRARY=$library" >> "$GITHUB_ENV"
 
@@ -158,9 +220,13 @@ jobs:
             git make mingw-w64-x86_64-gcc mingw-w64-x86_64-lz4
             mingw-w64-x86_64-zlib
 
-      - name: Cache Chez Scheme
+      # See the POSIX lane for why this is restore/save rather than
+      # actions/cache. This job is where it mattered most: its post-job save was
+      # skipped on every failing run, so it rebuilt Chez (6m46s) on each
+      # iteration of a ~90s suite and never once populated the cache.
+      - name: Restore Chez Scheme
         id: cache-chez-windows
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: chez-install
           key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-mingw64-v1
@@ -195,6 +261,15 @@ jobs:
           echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
           "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
           grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
+
+      # Saved before any test runs, so a red suite cannot cost the next run a
+      # 6m46s Chez rebuild.
+      - name: Save Chez Scheme
+        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: chez-install
+          key: ${{ steps.cache-chez-windows.outputs.cache-primary-key }}
 
       - name: Checkout pinned Jolt fork
         uses: actions/checkout@v4
@@ -249,7 +324,19 @@ jobs:
       - name: Checkout jolt-http
         uses: actions/checkout@v4
 
+      # This lane previously had no cache at all and rebuilt tarm64nt Chez from
+      # source on every run (~7 min) to execute a handful of descriptor-
+      # independent tests. Only the built output is cached; the checkout below
+      # is skipped on a hit, so nothing is cloned either.
+      - name: Restore native ARM64 Chez Scheme
+        id: cache-chez-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: chez-arm64/tarm64nt
+          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-tarm64nt-v1
+
       - name: Checkout official Chez Scheme v10.4.1
+        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: cisco/ChezScheme
@@ -259,6 +346,7 @@ jobs:
           path: chez-arm64
 
       - name: Build native ARM64 Chez Scheme from source
+        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           cd /d "%GITHUB_WORKSPACE%\chez-arm64"
@@ -286,6 +374,15 @@ jobs:
           if (-not $version.Contains('10.4.1')) {
             throw "expected Chez Scheme 10.4.1, got: $version"
           }
+
+      # Saved only after the build above has been asserted good, and before the
+      # preview runs, so a red preview cannot cost the next run a full rebuild.
+      - name: Save native ARM64 Chez Scheme
+        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: chez-arm64/tarm64nt
+          key: ${{ steps.cache-chez-arm64.outputs.cache-primary-key }}
 
       # One checked-in main covers both preview claims: the descriptor-independent
       # HTTP tests actually run on native ARM64, AND jolt.net still fails closed
