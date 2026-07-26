@@ -284,7 +284,13 @@
   (with (assoc opts :test-cases 60 :name "body/file-writer")
         [payload (g/vector {:max-size 4096} (g/octet))
          cap     (g/integer 1 256)]
-        (let [f (java.io.File. (str "/tmp/jolt-http-prop-" (count payload) "-" cap ".bin"))]
+        ;; Not "/tmp": that is a POSIX path, and on a native Windows runner with
+        ;; no \tmp on the current drive this failed with "no such file or
+        ;; directory", so the property reported a missing file instead of
+        ;; testing the writer. See hegel-support/temp-path.
+        (let [f (java.io.File.
+                 ^String (hegel-support/temp-path
+                          (str "jolt-http-prop-" (count payload) "-" cap ".bin")))]
           (try
             (with-open [out (java.io.FileOutputStream. f)]
               (.write out (m/->ba payload)))
