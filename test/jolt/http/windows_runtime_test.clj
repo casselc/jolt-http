@@ -65,6 +65,17 @@
 (defn- err-of [outcome]
   (:err (ex-data (:error outcome))))
 
+(defn- kind-of [outcome]
+  (:jolt.net/kind (ex-data (:error outcome))))
+
+(defn- classified?
+  "True when a failure carries a classification from either boundary: teensyp's
+  own :err, or jolt.net's transport :jolt.net/kind. A refused connect is
+  reported by the latter, so requiring only :err would reject a correctly
+  classified error."
+  [outcome]
+  (or (some? (err-of outcome)) (some? (kind-of outcome))))
+
 (defn- utf8 ^bytes [^String s] (.getBytes s "UTF-8"))
 (defn- ->str [^bytes b] (when b (String. b "UTF-8")))
 
@@ -383,13 +394,29 @@
       ;; still that the attempt fails rather than succeeding.
       (let [outcome (settled 30000 #(connect! port))]
         (is (not= ::watchdog outcome))
-        (when (nil? (:error outcome))
-          ;; A port can legitimately be reused by another listener between stop
-          ;; and this probe. Only a connection that talks HTTP would be a real
-          ;; failure, and there is nothing left to serve it.
-          (client/close! (:value outcome)))
-        (is (or (some? (:error outcome))
-                (some? (:value outcome))))))))
+        (if (some? (:error outcome))
+          ;; The ordinary case: nothing is listening any more, so the connect is
+          ;; refused and classified rather than hanging.
+          (is (classified? outcome)
+              "a refused connect must carry a classified error")
+          ;; A port can legitimately be recycled by an unrelated listener between
+          ;; stop and this probe, so a successful connect is not by itself a
+          ;; failure. What must never happen is this port still answering HTTP:
+          ;; the server that was serving it has been stopped.
+          (let [connection (:value outcome)]
+            (try
+              (client/send-all! connection
+                                (utf8 "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+                                {:timeout-ms 5000})
+              (let [got (settled #(read-until connection (n-responses? 1) 3000))]
+                (is (not= ::watchdog got))
+                (is (not (string? (:value got)))
+                    "a stopped server answered an HTTP request"))
+              (catch :default _
+                ;; Writing to or reading from a socket nothing owns fails. That
+                ;; is the expected outcome and agrees with the claim above.
+                nil)
+              (finally (client/close! connection)))))))))
 
 (deftest connection-close-is-idempotent-and-fails-closed
   (with-server* {} hello-handler
