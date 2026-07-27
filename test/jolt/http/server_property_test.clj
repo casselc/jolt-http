@@ -405,65 +405,63 @@
 
 ;; --- 3. request bodies large enough to exercise backpressure ---------------
 
-;; This property's observer bound is deliberately not the shared 8 s default.
+;; This property's observer bound is the shared 8 s default again, and its
+;; TooSlow suppression is gone. Both were workarounds for a jolt-tcp/jolt-net
+;; defect that has since been fixed upstream; this comment records why they
+;; existed and why they no longer need to.
 ;;
-;; The fixture below (1 KB read buffer, stream queue of 2, bodies up to 120 KB)
-;; drives up to ~118 reactor read cycles per case, which is an order of
-;; magnitude more than any other property here. On POSIX each of those cycles is
-;; exposed to a jolt-tcp reactor re-arm latency: when a handler arity completes
-;; in the window after the reactor has drained its pending set but before it
-;; re-enters `net/await-ready`, the connection is only re-serviced on the next
-;; tick of that wait, which jolt-tcp fixes at 1000 ms. The observed response
-;; latency for one case is therefore (real work) + k x 1000 ms.
+;; The fixture (1 KB read buffer, stream queue of 2, bodies up to 120 KB) drives
+;; up to ~118 reactor read cycles per case, an order of magnitude more than any
+;; other property here. Each of those cycles was exposed to a reactor re-arm
+;; latency: when a handler arity completed in the window after the reactor had
+;; drained its pending set but before it re-entered `net/await-ready`, the
+;; publication was consumed as though the reactor had already seen it and the
+;; connection was only re-serviced on the next tick of that wait, which jolt.net
+;; caps at 1000 ms. Observed latency for one case was therefore
+;; (real work) + k x 1000 ms.
 ;;
-;; That was measured, not assumed, and the raw evidence is recorded in
-;; docs/runtime/windows-http-runtime.md:
+;; That was measured, not assumed; the raw evidence is in
+;; docs/runtime/windows-http-runtime.md. On Linux, this exact fixture over 15
+;; consecutive 93388-byte exchanges produced 183/2188/2216/3222/4219/4245/4246/
+;; 4248/6228/6234/6251/7245/7301/8257/8296 ms -- a base cost plus a whole number
+;; of 1 s steps, with every body delivered whole and correct and ZERO wedges.
+;; The same stall reproduced with jolt-tcp alone and no HTTP layer, and vanished
+;; when the read buffer was widened, which placed the cause below this
+;; repository. It was never observed on native Windows x86-64.
 ;;
-;;   - Linux, this exact fixture, 15 consecutive 93388-byte exchanges under a
-;;     120 s watchdog: every one delivered the body whole and correct, with
-;;     latencies of 183/2188/2216/3222/4219/4245/4246/4248/6228/6234/6251/
-;;     7245/7301/8257/8296 ms -- a base cost plus a whole number of 1 s steps,
-;;     and ZERO wedges.
-;;   - The same stall reproduces with jolt-tcp alone and no HTTP layer, and
-;;     disappears when the read buffer is widened (fewer cycles), which places
-;;     it below this repository.
-;;   - It is not observed on native Windows x86-64 at all.
+;; The cause was jolt.net's `await-ready` treating its own entry as the
+;; stale/fresh boundary for wake epochs, so a publication landing between a
+;; consumer's read of producer state and its await was discarded as stale. The
+;; fix is a caller-supplied monotonic wake cursor (jolt-net
+;; `poller/wake-cursor`, jolt-tcp sampling it before `process-pending!`); see
+;; jolt-net's docs/proofs/socket-invariants.md and jolt-tcp's
+;; docs/proofs/reactor-lifecycle-invariants.md section 7.
 ;;
-;; So the 8 s bound was not measuring liveness, it was sampling the tail of a
-;; lower-layer latency distribution -- which is exactly why it produced a
-;; libhegel "flaky" classification (seed 9157075391771664454, case
-;; {:size 93388, :framing :content-length}) rather than a reproducible failure.
-;; The bound below is sized at ~5x the worst latency observed across many runs.
-;; It is a LIVENESS bound: progress is bounded and every byte still has to
-;; arrive intact, so a case that exhausts it has genuinely stopped, and that is
-;; still a failure. Widening the buffers to dodge the latency instead would
+;; Two workarounds were removed once the pin moved to the fixed jolt-tcp:
+;;
+;;   - The per-case bound had been widened from 8 s to 45 s, because the 8 s
+;;     bound was not measuring liveness but sampling the tail of a lower-layer
+;;     latency distribution -- which is why it produced a libhegel "flaky"
+;;     classification (seed 9157075391771664454, case
+;;     {:size 93388, :framing :content-length}) rather than a reproducible
+;;     failure.
+;;   - TooSlow was suppressed for this property, because libhegel's aggregate
+;;     health check has a 30 s threshold for the whole run and aborted before
+;;     any per-case bound could be reached. That is what actually failed on
+;;     macOS x86-64: "only 8 valid inputs after 38.082074097s (threshold 30s)",
+;;     with 15.2/16.3/26.4/26.5/27.4/31.8 s passing and 32.4 s failing.
+;;
+;; Replaying the witness seed against the fixed stack, this property completes
+;; its 20 cases in 2584/2620/2768 ms -- roughly 130 ms per case against the 8 s
+;; per-case bound, and about an eleventh of the 30 s TooSlow threshold. Both
+;; workarounds are therefore restored to the defaults rather than kept as
+;; permanent allowances for a bug that no longer exists.
+;;
+;; The bound remains a LIVENESS bound: progress is bounded and every byte still
+;; has to arrive intact, so a case that exhausts it has genuinely stopped and
+;; that is still a failure. Widening the buffers to dodge latency would instead
 ;; delete the backpressure coverage this property exists for.
-(def ^:private backpressure-timeout-ms 45000)
-
-;; ...but the per-case bound above is NOT the binding constraint, and sizing it
-;; alone was not enough. libhegel applies its own aggregate TooSlow health check
-;; to the whole property, and that is what actually failed on macOS x86-64:
-;;
-;;   FailedHealthCheck: TooSlow — input generation is slow: only 8 valid inputs
-;;   after 38.082074097s (threshold 30s).
-;;
-;; The threshold is 30 s for the ENTIRE run, so a 45 s per-case bound could
-;; never be reached: the engine aborts the property first. Observed durations on
-;; macOS x86-64 make the race plain -- 15.2 s, 16.3 s, 26.4 s, 26.5 s, 27.4 s
-;; and 31.8 s all passed, 32.4 s failed. Same jolt-tcp re-arm latency documented
-;; above, on the slowest hosted runner.
-;;
-;; Suppressing TooSlow is what the check itself recommends for an expected cost,
-;; and it is sound for this property specifically: the generators are a bounded
-;; integer and a keyword, so input *generation* is trivial. The elapsed time is
-;; the property body pushing up to 120 KB through a deliberately undersized
-;; buffer over real loopback TCP -- which is the coverage, not a smell.
-;; Suppression is scoped to this one property; every other property keeps the
-;; check, so a genuine generation slowdown elsewhere still fails.
-;;
-;; It does not weaken the oracle: correctness is still asserted per case, and
-;; liveness is still bounded by backpressure-timeout-ms above.
-(def ^:private backpressure-health-checks #{:too-slow})
+(def ^:private backpressure-timeout-ms 8000)
 
 (defn- prop-request-body-backpressure []
   (with-server {:handler digest-handler :read-buffer-size 1024 :stream-queue-size 2}
@@ -472,8 +470,7 @@
        "a large request body is delivered whole under backpressure"
        (fn []
          (h/run-test!
-          (assoc run-opts :test-cases 20 :name "server/request-backpressure"
-                 :suppress-health-checks backpressure-health-checks)
+          (assoc run-opts :test-cases 20 :name "server/request-backpressure")
           (fn [_]
             ;; A small read buffer and a short stream queue mean the parser's
             ;; blocking channel put parks, the socket stays WORKING and the
