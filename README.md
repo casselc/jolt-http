@@ -291,8 +291,8 @@ implementation-test boundaries.
 ## Testing
 
 ```sh
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -A:test -m hegel.install
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -M:test
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt -A:test -m hegel.install
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt -M:test
 ```
 
 Linux x86_64, Linux aarch64 (`ubuntu-24.04-arm`), macOS arm64 and macOS x86_64
@@ -348,21 +348,21 @@ one explicit non-negative signed 64-bit seed across a selected property group:
 
 ```sh
 JOLT_HTTP_HEGEL_SEED=6635181287260819147 \
-  JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
+  JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
   -M:test "protocol properties"
 ```
 
 Run a subset by naming scenarios:
 
 ```sh
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
   -M:test "pipelining" "keep-alive"
 ```
 
-The current reviewed core baseline is
-`85f645aa1178e4b631198dcbaf46bdad1283750b`. `deps.edn` pins jolt-tcp at
-`6a311ea8242c867f906ce164bd39d7f33a499a3f`, which transitively pins jolt-net
-at `a4a4deb6b757d5e86aeb941cf646927e21420df6`.
+The current reviewed core baseline is the upstream-v0.5.4 rebase at
+`89fe46e8a826b60b69d264fab76c864881055830`. `deps.edn` pins jolt-tcp at
+`f0e73381e4e715e10a0e07cc1e93227026d7bb3b`, which transitively pins jolt-net
+at `bd9865c3e6c73f8ec3dcfad8c00f718bd1973c46`.
 
 Progress is also written to the absolute
 `jolt-http-test-progress.log` path under the platform temp directory

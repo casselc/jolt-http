@@ -18,16 +18,21 @@ contract over jolt-tcp's `jolt.net`-backed readiness reactor, so native safety a
 changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
-The reviewed Jolt proposal fork is published only to `casselc/jolt` on
-`codex/upstream-improvements-6-8`; nothing has been pushed to the upstream
-project's origin. Six stacked draft PRs exist inside the fork only; none targets
-upstream. Its current HTTP prerequisites include scoped array ranges at
-`1c8fdb97`, Windows path handling at `358c42b7`, the variadic FFI boundary at
-`ecf7728f`, and transactional Git dependency resolution at `9dc88108` (carried
-forward into the current reviewed core baseline
-`85f645aa1178e4b631198dcbaf46bdad1283750b`). The known-unsound
-runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
-`21062d5b` and is not part of the proposal branch.
+The reviewed Jolt proposal fork is published only to `casselc/jolt`, now
+rebased over upstream v0.5.4 on `codex/upstream-rebase-2026-07-26`; nothing has
+been pushed to the upstream project's origin and no pull request has been
+opened. The current reviewed core baseline is
+`89fe46e8a826b60b69d264fab76c864881055830`. Its HTTP prerequisites include
+scoped array ranges at rebased commit `701c5ca5`, Windows path handling, the
+variadic FFI boundary at rebased commit `339534c7`, and transactional Git
+dependency resolution. The per-namespace runtime AOT design remains excluded
+from the active loader because it cannot replay downstream top-level effects.
+
+The current dependency pin is jolt-tcp
+`f0e73381e4e715e10a0e07cc1e93227026d7bb3b`, transitively using jolt-net
+`bd9865c3e6c73f8ec3dcfad8c00f718bd1973c46`. The pin retains the W6A.1 wake
+cursor repair and aligns every hosted runtime checkout with the same rebased
+core.
 
 ## Implementation update — 2026-07-24
 

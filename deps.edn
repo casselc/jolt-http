@@ -9,13 +9,13 @@
 
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "8a898b3f24f66cab9d90e950022a17b3c06a70f1"}}
+         :git/sha "f0e73381e4e715e10a0e07cc1e93227026d7bb3b"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public
  ;; direct-libhegel branch commit. Because the dep is alias-scoped, the installer
  ;; needs the alias too:
- ;; `JOLT_CACHE_DIR=.jolt-cache/jolt-hegel-<sha> joltc -A:test -m hegel.install`
+ ;; `JOLT_CACHE_DIR=.jolt-cache/jolt-hegel-<sha> jolt -A:test -m hegel.install`
  ;; (the cache is keyed by the pinned SHA so another release cannot reuse its
  ;; compiled namespaces).
  :aliases {:test {:extra-paths ["test"]
@@ -24,7 +24,7 @@
                                 :git/sha "e03127174bcaea4ffa1c0cef11bde0efa009e9dc"}}
                   :main-opts ["-m" "jolt.http.server-test"]}
 
-           ;; Checked-in mains avoid joltc's currently POSIX-only stdin path on
+           ;; Checked-in mains avoid Jolt's currently POSIX-only stdin path on
            ;; native Windows while keeping each source-mode claim explicit.
            ;;
            ;; The runtime gate deliberately declares no :extra-deps. Real
@@ -43,4 +43,4 @@
            {:extra-paths ["test"]
             :main-opts ["-m" "jolt.http.windows-arm64-preview"]}}
 
- :tasks {test "joltc -M:test"}}
+ :tasks {test "jolt -M:test"}}
