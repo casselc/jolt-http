@@ -275,17 +275,21 @@ preview had no cache at all (~7 min of `build.bat` per run), and with no
 the cache the others were about to write — macOS x86-64 rebuilt Chez for 9m28s
 in one run despite the preceding run having just cached it.
 
-Every toolchain cache is now `actions/cache/restore` plus an explicit
-`actions/cache/save` placed **after the build is asserted good and before any
-test step**, so a red or cancelled run can no longer cost the next one a
-rebuild, and what is saved has always passed its version assertion. The ARM64
-lane caches its `tarm64nt` tree, the macOS x86-64 libhegel build is cached on
-the pinned `hegel-rust` commit and toolchain, and a
-`tests-${{ github.ref }}` concurrency group with `cancel-in-progress`
-supersedes in-flight runs.
+The response at the time was to replace every `actions/cache` use with
+`actions/cache/restore` plus an explicit `actions/cache/save` placed **after the
+build was asserted good and before any test step**, so a red or cancelled run
+could no longer cost the next one a rebuild, and to add a
+`tests-${{ github.ref }}` concurrency group with `cancel-in-progress`.
 
-Observed: Windows ARM64 7m19s → 1m21s, Windows x86-64 9m12s → 2m32s, macOS
+Observed then: Windows ARM64 7m19s → 1m21s, Windows x86-64 9m12s → 2m32s, macOS
 x86-64 13m03s → ~4m; full-matrix wall clock ~13 min → ~3.5 min.
+
+**W12 removed the Chez source builds entirely, so this trap no longer has a Chez
+instance to reintroduce.** The concurrency group remains, and the observation
+above is retained because the same failure mode still applies to any *future*
+post-job cache: the macOS x86-64 libhegel build is the one remaining hand-rolled
+`restore`/`save` pair in this workflow, and it is deliberately still shaped that
+way for exactly this reason. See the W12 section below.
 
 ## Windows ARM64 — promoted to a gating socket runtime (W8)
 
@@ -353,8 +357,11 @@ assertion or any HTTP test can pass.
 
 - **Source-runtime only.** No packaged `joltc`, no devboot, no AOT cache —
   `JOLT_AOT_CACHE=0`. Nothing here is evidence for a packaged or AOT ARM64 build.
-- The claim covers `windows-11-vs2026-arm` with official Chez 10.4.1 built from
-  source at the pins named above.
+- The claim covers `windows-11-vs2026-arm` with official Chez 10.4.1 at the pins
+  named above. W8 built that Chez from source on the runner; since W12 the same
+  official 10.4.1 arrives as the digest-pinned `tarm64nt` toolchain archive. The
+  ARM64 evidence is unchanged in kind — the `(machine-type) == tarm64nt` witness
+  is applied to whichever `scheme.exe` the lane is about to run.
 
 ## Proof boundary
 
@@ -389,6 +396,155 @@ aarch64 for a structural reason rather than by re-derivation:
 Had any HTTP semantics differed on ARM64, the obligation would have been to stop
 and identify the exact proof affected rather than to widen a platform claim. No
 such difference was observed, and no HTTP production change was made.
+
+## W12 — CI moved to the shared immutable Chez toolchain
+
+Every lane built Chez Scheme from source. The POSIX matrix cloned
+`cisco/ChezScheme` and ran configure/make/make install; Windows x86-64 did the
+same under an MSYS2 MINGW64 toolchain; Windows ARM64 ran `build.bat tarm64nt`
+over a full ChezScheme checkout. Each build was guarded by a hand-rolled
+`actions/cache` entry keyed by a string **nothing verified**, so a restored
+toolchain was trusted purely because its key matched.
+
+All six lanes now install the same immutable, checksum-pinned release.
+
+| item | value |
+| --- | --- |
+| branch | `claude/http-shared-toolchain` |
+| base | `e27ecc1a7e41607fe3fbf86b3d9b7e101004f219` (`codex/windows-arm64-v0.5.7-integration`) |
+| tested workflow revision | `582b6a7aa80abba6936c3c3c79a13d39da1b4108` |
+| action | `casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3` |
+| release | `chez-ci-10.4.1.1` |
+| capability requested | `source-runtime` |
+
+`source-runtime` is the honest boundary: jolt-http runs Clojure-on-Chez through
+the source Jolt launcher with `JOLT_AOT_CACHE=0` and links nothing against the
+Chez kernel. The GNU kernel-development inputs the old MSYS2 lane staged
+(`scheme.h`, `libkernel.a`, `JOLT_CHEZ_CSV`, a `cc` shim) are **not** requested.
+
+The action verifies the archive digest, its descriptor, its internal manifest,
+the extracted inventory, and the requested capability before exporting an
+executable. There is deliberately **no source-build fallback**: a digest mismatch
+fails the job, because a fallback would convert a supply-chain failure into a
+slow green run.
+
+### Per-target archive digests, as observed on the runners
+
+Each lane pins its own SHA-256 next to its target, so a wrong target/digest
+pairing cannot pass. Every value below was echoed by the lane itself from
+`steps.chez.outputs.archive-sha256`, and matched on both runs:
+
+| target | archive SHA-256 |
+| --- | --- |
+| `linux-x86_64` | `16476cd98fb5cb2e2c0285e88fcd6d57ade9392ca8d7cf603ca38432b4118526` |
+| `linux-aarch64` | `b5b2306d3d6468b5fc7d5836721b09c704c7750f887a6232f1aeeb567d55f5d9` |
+| `macos-arm64` | `d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f` |
+| `macos-x86_64` | `e4577ad71b1f1e1062c361fa612af60d75378e64dc2869d8c8eefd3d7efdbc62` |
+| `windows-x86_64` | `360c60496eea2f8aab0e557eb77e9e18b315bb9181938158ae57655aa541b7f8` |
+| `windows-arm64` | `9bc28462823a1447de6d849e129758a6317cc9deafb8e87414817e7244f149c8` |
+
+### Cold run — [`30407168310`](https://github.com/casselc/jolt-http/actions/runs/30407168310)
+
+No `jolt-chez-archive-*` cache key existed anywhere in the repository before this
+run, so the miss is real rather than arranged.
+
+| lane | job | cache | result | wall clock |
+| --- | --- | --- | --- | --- |
+| Linux x86_64 | `90435084736` | miss | 316 checks, 0 failures | 1m22s |
+| Linux aarch64 | `90435084620` | miss | 316 checks, 0 failures | 1m22s |
+| macOS arm64 | `90435084611` | miss | 316 checks, 0 failures | 1m15s |
+| macOS x86_64 | `90435084605` | miss (+ libhegel miss) | 316 checks, 0 failures | 5m42s |
+| Windows x86_64 | `90435084581` | miss | 8 tests / 68 assertions, then 316 checks, 0 failures | 1m57s |
+| Windows aarch64 | `90435084584` | miss | 8 tests / 68 assertions, then 316 checks, 0 failures | 4m22s |
+
+All six logged `Cache not found for input keys: jolt-chez-archive-chez-ci-10.4.1.1-<target>-<digest-prefix>`,
+downloaded the release asset, and reported
+`installed chez-ci-10.4.1.1/<target> … archive sha256=<expected>`. Run wall clock
+23:11:12Z → 23:22:01Z (10m49s), of which ~5 min was runner queueing; longest job
+5m42s.
+
+### Warm run — [`30407836912`](https://github.com/casselc/jolt-http/actions/runs/30407836912)
+
+Same revision `582b6a7`, dispatched with no source change.
+
+| lane | job | cache | result | wall clock |
+| --- | --- | --- | --- | --- |
+| Linux x86_64 | `90437183219` | **hit** | 316 checks, 0 failures | 1m19s |
+| Linux aarch64 | `90437183395` | **hit** | 316 checks, 0 failures | 1m17s |
+| macOS arm64 | `90437183240` | **hit** | 316 checks, 0 failures | 1m20s |
+| macOS x86_64 | `90437183237` | **hit** (+ libhegel hit) | 316 checks, 0 failures | 3m03s |
+| Windows x86_64 | `90437183202` | **hit** | 8 tests / 68 assertions, then 316 checks, 0 failures | 2m17s |
+| Windows aarch64 | `90437183143` | **hit** | 8 tests / 68 assertions, then 316 checks, 0 failures | 3m26s |
+
+All six logged `Cache restored from key: …` and `cache hit = true`, with **zero
+misses and zero archive downloads**, and reported the identical digests. Run wall
+clock 23:23:40Z → 23:27:12Z (3m32s); longest job 3m26s.
+
+Every generative group ran non-vacuously on every lane in both runs: pure
+properties `Ran 24 tests. 32 assertions passed, 0 failures, 0 errors.`, protocol
+properties `Ran 19 tests. 25 assertions passed, 0 failures, 0 errors.`, and the
+complete `-M:test` suite `316 checks, 0 failures` under `JOLT_HEGEL_REQUIRED=1`.
+The counts are identical cold and warm, and identical to the pre-migration
+counts recorded earlier in this document.
+
+### What is asserted, not assumed
+
+- **No source-build fallback ran.** Across all twelve job logs, the strings
+  `cisco/ChezScheme`, `build.bat`, `setup-msys2`, `configure --threads` and
+  `make -j` occur **zero** times. No `msys2` step, MinGW package install, or
+  ChezScheme checkout remains in the workflow.
+- **Windows ARM64 keeps its architecture witnesses.** `runner.arch == ARM64`,
+  Chez `--version` containing `10.4.1`, and `(machine-type)` read through a
+  `--script` probe, all applied to the *shipped* `scheme.exe`. Both runs logged
+  `chez machine-type: tarm64nt`. An x86-64 image published under the ARM64 target
+  name would fail here rather than run under emulation. The in-test
+  `JOLT_EXPECTED_ARCH=aarch64` → `[:windows :aarch64 64]` check is unchanged. The
+  descriptor is an additional check, never a substitute for executing the binary
+  on real ARM64 hardware.
+- **The macOS x86-64 libhegel path is intact.** The pinned `hegel-rust`
+  `f81c6cce` source checkout, the Rust 1.86.0 `cargo build --locked -p hegeltest-c
+  --release`, and its `restore`/`save` cache keyed
+  `libhegel-macOS-X64-0.30.1-f81c6cce-rust1.86.0-v1` were untouched. That is a
+  libhegel concern, not a Chez one. The cold run shows
+  `Cache not found for input keys: libhegel-…` and built it; the warm run shows
+  `Cache restored from key: libhegel-…`.
+- **No Node.js 20 deprecation warnings** in any of the twelve logs. Every
+  third-party action is pinned by full commit SHA at a node24 major:
+  `actions/checkout@fbc6f39` (v5.1.0) and `actions/cache/{restore,save}@caa2961`
+  (v5.1.0). The action's own internal cache use is already node24.
+- **`permissions: contents: read`** was added at workflow level.
+- Nothing was added to manufacture green: no sleeps, no retries, no widened
+  timeouts, no skipped groups, no `continue-on-error`. The 45- and 60-minute job
+  timeouts and the 900/2400-second script timeouts are unchanged.
+
+### Diff boundary
+
+- `git diff e27ecc1..HEAD -- src test` is **empty**. No production and no test
+  semantic change.
+- `git diff --check` is clean.
+- Jolt core, jolt-net, jolt-tcp and jolt-hegel pins are **unchanged**; `deps.edn`
+  is untouched. Repinning to the v0.5.10 core is intentionally a follow-on after
+  the core rebase, not part of W12.
+
+### Deviations and remaining boundaries
+
+- The macOS arm64 lane keeps its existing `macos-14` runner. The toolchain
+  descriptor names `macos-15` as that target's build runner; the archive was
+  observed installing, verifying, and running the full suite on `macos-14` in
+  both runs, so the lane was left as it was rather than changed to match the
+  descriptor.
+- `zstd` is the one genuine dependency addition: the POSIX archives are
+  `.tar.zst`. It is installed only when the image does not already ship it. The
+  former `build-essential` / `liblz4-dev` / `zlib1g-dev` / `libncurses-dev` /
+  `uuid-dev` / `libssl-dev` and `brew lz4 openssl@3` sets existed solely to
+  compile Chez and are gone.
+- Windows x86-64 lost its job-level `shell: msys2 {0}` default and is native
+  PowerShell throughout. The only shell mechanism retained is the POSIX `sh` the
+  source Jolt launcher reads through `JOLT_SH` while deriving its git cache key;
+  both Windows lanes now resolve Git for Windows' `sh.exe` explicitly and pass it
+  as `-ShellExe`, rather than relying on a PATH that no longer carries MSYS2.
+- Still source-runtime evidence only, on both Windows architectures: no packaged
+  `joltc`, no devboot, no AOT cache.
 
 ## Follow-on W9 — downstream Ring adapter validation
 

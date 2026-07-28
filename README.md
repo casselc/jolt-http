@@ -297,10 +297,18 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt -M:test
 
 Linux x86_64, Linux aarch64 (`ubuntu-24.04-arm`), macOS arm64 and macOS x86_64
 (`macos-15-intel`) all have observed native runtime evidence for the complete
-real-loopback suite with source-built Chez 10.4.1 — these are no longer
+real-loopback suite with official Chez 10.4.1 — these are no longer
 candidate rows. Because libhegel 0.30.1 publishes no Darwin/x86_64 asset, the
 Intel job builds its exact tagged source and supplies the resulting library
 explicitly.
+
+Chez is not built from source anywhere in CI. All six lanes install the same
+immutable, checksum-pinned `chez-ci-10.4.1.1` release through
+`casselc/jolt-toolchains/setup-chez`, pinned by full commit SHA and requested
+with an explicit per-target archive SHA-256 and the `source-runtime` capability.
+The action verifies the archive digest, descriptor, internal manifest, extracted
+inventory and capability before exporting an executable, and there is
+deliberately no source-build fallback — a digest mismatch fails the job.
 
 Every POSIX lane runs with `JOLT_HEGEL_REQUIRED=1`, matching both Windows lanes.
 Installing libhegel is not the same as requiring it: a missing library already
@@ -327,8 +335,9 @@ bash. See [docs/runtime/windows-http-runtime.md](docs/runtime/windows-http-runti
 for the observed evidence and the pins it was taken against.
 
 Windows aarch64 runs the **same two lanes, and gates on both**, on
-`windows-11-vs2026-arm`. It builds official Chez 10.4.1 from source, asserts
-`runner.arch == ARM64` and Chez `(machine-type) == tarm64nt`, then runs the same
+`windows-11-vs2026-arm`. It installs the digest-pinned official Chez 10.4.1
+`tarm64nt` toolchain, asserts `runner.arch == ARM64` and — against that shipped
+executable — Chez `(machine-type) == tarm64nt`, then runs the same
 dependency-free real-loopback gate and the same `JOLT_HEGEL_REQUIRED=1` suite as
 x86-64 — the same 55 scenario groups, the same 8 tests / 68 assertions, and the
 same 316 checks. No runtime or socket group is skipped on either architecture.
