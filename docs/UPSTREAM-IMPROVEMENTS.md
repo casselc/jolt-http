@@ -7,17 +7,17 @@ upstream issue tracker.
 ## Verification baseline
 
 Revalidated 2026-07-28 against hosted CI run
-[`30323400505`](https://github.com/casselc/jolt-http/actions/runs/30323400505)
-(jolt-http `65c4ddb`), green across all six lanes:
+[`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304)
+(jolt-http `25af61c`), green across all six lanes:
 
 - Jolt core `46e1f74fc14f29283586900ef4b98c45375c0500`, source-mode over Chez
   10.4.1 built from source on every lane — no packaged `joltc`, no AOT cache;
-- jolt-tcp `e27d5c7152d5746b96382587a084c4f2001f3cb6`, transitively jolt-net
+- jolt-tcp `911cf783d56e988adb2b8f716b6636fae5454e52`, transitively jolt-net
   `c3747385235df812e0d739a3e9f71c4dfb07b474`; and
-- jolt-hegel `defab7f4385bf9409cae8e512defa3d60c8d926a` with libhegel 0.30.1.
+- jolt-hegel `c406e6a85e9902dd89a42a3abce3d6161e5cd406` with libhegel 0.30.1.
 
 The earlier baseline (2026-07-23, installed `joltc v0.4.15` and Jolt
-`d5aaf503fc7a45c5638d21215eb153b426a7e8dc`) predates the v0.5.4 rebase and no
+`d5aaf503fc7a45c5638d21215eb153b426a7e8dc`) predates the v0.5.7 rebase and no
 longer describes any lane.
 
 jolt-http has no direct FFI. It layers an HTTP/1.1 parser and Ring-shaped handler
@@ -26,7 +26,7 @@ changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
 The reviewed Jolt proposal fork is published only to `casselc/jolt`, now
-rebased over upstream v0.5.4 on `codex/upstream-rebase-2026-07-26`; nothing has
+rebased over upstream v0.5.7 on `codex/upstream-rebase-v0.5.7`; nothing has
 been pushed to the upstream project's origin and no pull request has been
 opened. The current reviewed core baseline is
 `46e1f74fc14f29283586900ef4b98c45375c0500`. Its HTTP prerequisites include
@@ -36,7 +36,7 @@ dependency resolution. The per-namespace runtime AOT design remains excluded
 from the active loader because it cannot replay downstream top-level effects.
 
 The current dependency pin is jolt-tcp
-`e27d5c7152d5746b96382587a084c4f2001f3cb6`, transitively using jolt-net
+`911cf783d56e988adb2b8f716b6636fae5454e52`, transitively using jolt-net
 `c3747385235df812e0d739a3e9f71c4dfb07b474`. The pin retains the W6A.1 wake
 cursor repair, adds reviewed Winsock readiness for aarch64 alongside x86-64, and
 aligns every hosted runtime checkout with the same rebased core — which is now
@@ -48,7 +48,7 @@ held in a single `JOLT_CORE_SHA` workflow variable rather than repeated per job.
   `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
   failure injection.
 - `deps.edn` pins jolt-tcp at
-  `e27d5c7152d5746b96382587a084c4f2001f3cb6`, which transitively pins the
+  `911cf783d56e988adb2b8f716b6636fae5454e52`, which transitively pins the
   validated jolt-net revision `c3747385235df812e0d739a3e9f71c4dfb07b474`. CI
   resolves this immutable graph directly rather than cloning mutable sibling
   branches. (The 2026-07-24 entry below was written against jolt-tcp
@@ -437,14 +437,15 @@ and socket edge cases live in one audited implementation.
 ### Local implementation status
 
 `jolt.net` now owns endpoints, resolution, sockets, readiness registration,
-wakeup, structured native errors, and handle generations on Linux, macOS **and
-Windows x86-64**. jolt-tcp is implemented over that public surface and exposes
+wakeup, structured native errors, and handle generations on Linux, macOS,
+Windows x86-64 **and Windows aarch64**. jolt-tcp is implemented over that
+public surface and exposes
 actual local/peer endpoint maps through `socket-info`; jolt-http derives
 `:server-port`, `:server-name`, and `:remote-addr` there without importing
 `jolt.net` or `jolt.ffi`.
 
 Windows readiness is no longer follow-up work, on either architecture. The
-pinned jolt-tcp revision (`e27d5c7`) ships reviewed Winsock readiness backends
+pinned jolt-tcp revision (`911cf78`) ships reviewed Winsock readiness backends
 and a public client for x86-64 **and aarch64** over jolt-net `c3747385`, and
 both of jolt-http's Windows lanes now run the complete real-loopback suite
 rather than a portable subset — the same 55 scenarios they run on Linux, with no

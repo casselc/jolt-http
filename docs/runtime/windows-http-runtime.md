@@ -11,16 +11,16 @@ Jolt, `JOLT_AOT_CACHE=0`. No lane on this platform uses a packaged `joltc`, a
 devboot, or an AOT cache, and none of the results below should be read as
 evidence for those.
 
-## Pins (W8)
+## Pins (final public v0.5.7 stack)
 
 | Component | Pin |
 | --- | --- |
-| jolt-http | `65c4ddbf05ec0fcaf0370aa309604aa39bd186d7` (`claude/windows-arm64-http-runtime`) |
+| jolt-http | `25af61c541a6cd4eb765faacea7bbd89eb154113` (`codex/windows-arm64-v0.5.7-integration`) |
 | jolt-http base | `2f877462363e7979b67353d52694fba5e0b9c3fb` (`claude/http-backpressure-bound-restore`) |
-| jolt-tcp | `e27d5c7152d5746b96382587a084c4f2001f3cb6` |
+| jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` |
 | jolt-net (transitive, via jolt-tcp) | `c3747385235df812e0d739a3e9f71c4dfb07b474` |
 | Jolt core (every CI and runtime checkout) | `46e1f74fc14f29283586900ef4b98c45375c0500` |
-| jolt-hegel (test-time only) | `defab7f4385bf9409cae8e512defa3d60c8d926a` (`chucklehead-dev/jolt-hegel`) |
+| jolt-hegel (test-time only) | `c406e6a85e9902dd89a42a3abce3d6161e5cd406` (`chucklehead-dev/jolt-hegel`) |
 | libhegel | 0.30.1 |
 | Chez Scheme | 10.4.1 |
 
@@ -29,7 +29,7 @@ rather than repeated per job, so a platform cannot silently validate against a
 different core.
 
 jolt-net is reached **only** transitively through jolt-tcp; jolt-http declares no
-direct dependency on it. `c3747385` is the revision jolt-tcp `e27d5c7` actually
+direct dependency on it. `c3747385` is the revision jolt-tcp `911cf78` actually
 pins, and therefore the one every result below was produced against. It is not
 the tip of jolt-net's reviewed branch.
 
@@ -68,8 +68,8 @@ report success when no exit code is available, and propagates a nonzero one — 
 a green step means a real child exit code of 0 was read.
 
 Hosted CI on `casselc/jolt-http` (workflow `tests`, run
-[`30323400505`](https://github.com/casselc/jolt-http/actions/runs/30323400505),
-revision `65c4ddb`) is green across all six lanes — Linux x86-64, Linux aarch64,
+[`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304),
+revision `25af61c`) is green across all six lanes — Linux x86-64, Linux aarch64,
 macOS arm64, macOS x86-64, Windows x86-64 and Windows aarch64. **All six gate.**
 
 Every POSIX lane and both Windows suites run with `JOLT_HEGEL_REQUIRED=1`.
@@ -92,8 +92,10 @@ generated case: {:size 93388, :framing :content-length}
 observation: two 8-second response timeouts followed by a passing replay
 ```
 
-**W6A does not remove it.** On the new graph the seed still reproduced: 2 of 5
-replays failed, at sizes 93388 and 120000.
+**W6A did not remove it.** On that graph the seed still reproduced: 2 of 5
+replays failed, at sizes 93388 and 120000. The measurements below are the
+historical diagnosis that led to W6A.1; they are not a description of the final
+public pins.
 
 It is not an HTTP defect. Three measurements place it below this repository.
 
@@ -132,7 +134,7 @@ handoffs in 1–2 ms, with no stall. But a plain `teensyp.server` echo/consume
 server with a 1 KB read buffer and no HTTP involved reproduces the stall
 directly (max 2060 ms against a min of 35 ms, byte counts always exact).
 
-The owning layer is therefore **jolt-tcp's reactor re-arm path**: when a handler
+The owning layer was therefore **jolt-tcp's reactor re-arm path**: when a handler
 arity completes in the window after the reactor has drained its pending set but
 before it re-enters `net/await-ready`, the connection is only re-serviced on the
 next tick of that 1000 ms wait. jolt-http's fixture merely amplifies it, because
@@ -142,71 +144,30 @@ a 1 KB read buffer over a 93 KB body is ~92 exposures per case.
 same property completes its 20 generated cases in ~1.4 s on x86-64 and in
 1804 ms on aarch64 (run `30323400505`).
 
-### Disposition
+### Disposition — fixed at the owning layers
 
-Per the task's publication guardrails this was **not** fixed in jolt-tcp or
-jolt-net; the boundary is reported here instead. Reproducers are described above
-and are cheap to re-derive.
+W6A.1 closed the notification window rather than masking it:
 
-In this repository the property's observer bound was raised from the shared 8 s
-default to a documented 45 s (`backpressure-timeout-ms` in
-`test/jolt/http/server_property_test.clj`), sized at roughly 5x the worst
-latency observed across many runs. This satisfies the "do not merely increase
-the timeout" condition: native evidence shows the operation makes bounded
-progress and always delivers every byte, so the old 8 s bound was sampling the
-tail of a lower-layer latency distribution rather than measuring liveness —
-which is precisely why libhegel classified it *flaky* rather than producing a
-reproducible counterexample. The bound remains a liveness bound: a case that
-exhausts it has genuinely stopped, and that is still a failure. Widening the
-fixture's buffers to dodge the latency was rejected, because that would delete
-the backpressure coverage the property exists for.
+- jolt-net added a caller-supplied monotonic `poller/wake-cursor`; its final
+  public pin `c3747385` contains the reviewed implementation from `64b15e0`;
+- jolt-tcp samples that cursor before draining producer-owned pending work and
+  passes it into `await-ready`; its final public pin `911cf78` contains the
+  consumer change from `8a898b3`; and
+- the deterministic forced-race controls and six corrected/buggy/nonvacuity SMT
+  models are recorded in jolt-net's `socket-invariants.md` and jolt-tcp's
+  `reactor-lifecycle-invariants.md`.
 
-The enclosing scenario watchdog for the loopback group was raised 600 s → 960 s
-so the outer bound stays above the sum of the per-case bounds its slowest
-property can spend; otherwise a diagnosable per-case failure would surface as an
-opaque scenario timeout.
+The earlier HTTP branch had temporarily widened the per-case observer from 8 s
+to 45 s and suppressed libhegel's 30 s aggregate `TooSlow` check for this one
+property. The latter was the binding workaround on slow macOS x86-64 runners:
+the property body, not input generation, could take longer than the health
+check. Both workarounds were removed at HTTP commit `8768612` after the
+lower-layer fix. The observer is again 8 s and `TooSlow` is enabled.
 
-### The per-case bound was not the binding constraint
-
-Sizing that bound was necessary but **not sufficient**, and treating it as the
-whole fix was wrong. The macOS x86-64 lane — the slowest hosted runner, and one
-this branch had not measured when the 45 s bound was chosen — then failed
-intermittently with an opaque `engine/setup error`.
-
-Two things had to be fixed to see why:
-
-1. `hegel.report/run!` publishes a thrown setup, health-check or engine error
-   under `:exception`, but this suite's reporter destructured `:error` — a key
-   never present on that event. Every engine error had therefore always printed
-   a bare `nil` and discarded the exception.
-
-2. With that corrected, the cause is exact:
-
-   ```
-   FailedHealthCheck: TooSlow — input generation is slow: only 8 valid inputs
-   after 38.082074097s (threshold 30s).
-   ```
-
-libhegel applies a **30 s aggregate budget to the whole property**. A 45 s
-per-case bound can never be reached, because the engine aborts the property
-first. Observed durations on macOS x86-64 make the race plain:
-
-| duration | outcome |
-| --- | --- |
-| 15.2 s, 16.3 s, 26.4 s, 26.5 s, 27.4 s, 31.8 s | pass |
-| 32.4 s | TooSlow |
-
-Same jolt-tcp re-arm latency, just on slower hardware. `:too-slow` is therefore
-suppressed for this one property, which is what the check itself recommends for
-an expected cost. It is sound here specifically: the generators are a bounded
-integer and a keyword, so input *generation* is trivial; the elapsed time is the
-property body pushing up to 120 KB through a deliberately undersized buffer over
-real loopback TCP, which is the coverage. Every other property keeps the check,
-so a genuine generation slowdown elsewhere still fails.
-
-Verified by forcing the failure rather than waiting for it: with a 2.5 s
-artificial delay per case the property reliably tripped TooSlow at ~38 s; with
-the suppression it runs 68.4 s and passes, every case still checked.
+The original witness then completed its 20 cases in 2584/2620/2768 ms, with
+every byte conserved. The final six-platform run `30365467304` executes the
+same property at those defaults and is green. No HTTP production code changed;
+the diagnosis, repair, and proofs remain at the readiness/reactor boundary.
 
 ## Finding 2 — an over-limit rejection can be RST'd on Windows
 
@@ -319,15 +280,15 @@ Observed evidence:
 
 | item | value |
 | --- | --- |
-| run / job | [`30323400505`](https://github.com/casselc/jolt-http/actions/runs/30323400505) / `90163745148` |
-| revision | `65c4ddbf05ec0fcaf0370aa309604aa39bd186d7` |
+| run / job | [`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304) / `90295465550` |
+| revision | `25af61c541a6cd4eb765faacea7bbd89eb154113` |
 | runner | `windows-11-vs2026-arm`; `runner.arch = ARM64`, OS architecture `ARM 64-bit Processor` |
 | Chez | native 10.4.1, `(machine-type)` asserted `tarm64nt` |
 | target assertion | `JOLT_EXPECTED_ARCH=aarch64`, gate asserts `[:windows :aarch64 64]` |
 | dependency-free gate | `-M:windows-runtime-test` — 8 tests, 68 assertions passed, 0 failures, 0 errors, exit 0 |
 | complete suite | `-M:test` with `JOLT_HEGEL_REQUIRED=1` — 316 checks, 0 failures, exit 0 |
 | libhegel | `libhegel-windows-arm64.dll` 0.30.1, downloaded and sha256-verified on the runner |
-| wall clock | 10m30s including a from-source `tarm64nt` build |
+| wall clock | 8m31s including a from-source `tarm64nt` build |
 
 Every generative group ran non-vacuously on ARM64:
 
@@ -343,7 +304,7 @@ Both reasons the preview existed were retired by **lower-layer** evidence
 before this lane was promoted, not by relaxing anything here:
 
 - **No reviewed ARM64 descriptor.** jolt-net `c3747385` ships reviewed Winsock
-  readiness for x86-64 and aarch64 alike. jolt-tcp `e27d5c7` pins it and is green
+  readiness for x86-64 and aarch64 alike. jolt-tcp `911cf78` pins it and is green
   on real ARM64 loopback in run
   [`30322363564`](https://github.com/casselc/jolt-tcp/actions/runs/30322363564).
 - **The `Get-FileHash` installer blocker.** W6A recorded a jolt-hegel installer
@@ -407,3 +368,40 @@ aarch64 for a structural reason rather than by re-derivation:
 Had any HTTP semantics differed on ARM64, the obligation would have been to stop
 and identify the exact proof affected rather than to widen a platform claim. No
 such difference was observed, and no HTTP production change was made.
+
+## Follow-on W9 — downstream Ring adapter validation
+
+The next non-overlapping consumer slice is `ring-chez-adapter`. Its local
+`codex/jolt-http-validation` branch at
+`eebfefa` is already a thin compatibility wrapper around `jolt-http`; W9 should
+validate that boundary rather than move HTTP or socket semantics back into the
+adapter.
+
+W9 should:
+
+1. work in a new worktree from exact base `eebfefa`, leaving the existing
+   adapter checkout and the dirty `http-client` checkout untouched;
+2. pin jolt-http `25af61c541a6cd4eb765faacea7bbd89eb154113` and Jolt core
+   `46e1f74fc14f29283586900ef4b98c45375c0500`;
+3. add a dependency-free real-loopback gate driven by the public
+   `teensyp.client` test surface, with port zero, the actual bound port, a
+   Ring request map, 200 and 404 responses, descriptor opacity, deterministic
+   stop, and idempotent repeated stop;
+4. remove fixed startup sleeps from the acceptance path: `run-server` must
+   return only after the listener is usable, so a retry delay would hide a
+   lifecycle defect;
+5. characterize the existing `jolt-lang/http-client` compatibility gate
+   separately. If its published pin blocks the final stack, report the exact
+   missing capability and stop rather than modifying the dirty local checkout;
+6. run source-mode Linux and native Windows x86-64 checks with real child exit
+   codes and fail-closed target assertions, then prepare—but do not claim—a
+   six-platform CI matrix unless a writable public fork is explicitly selected;
+7. keep adapter production changes absent or minimal. Any discovered framing,
+   lifecycle, readiness, or descriptor problem belongs at jolt-http, jolt-tcp,
+   or jolt-net respectively and must be reported before another repository is
+   changed.
+
+`ring-chez-adapter` currently points at the upstream-owned `jolt-lang` origin.
+W9 therefore must not push, open a PR, or create a fork. Its deliverable is a
+clean local branch, exact commands and counts, the proposed CI patch, and a
+statement of which platform claims were actually observed.

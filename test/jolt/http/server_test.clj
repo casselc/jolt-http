@@ -1464,12 +1464,11 @@
    ;; from scratch.
    ["pure properties"      test-pure-properties      180000]
    ["protocol properties"  test-protocol-properties  300000]
-   ;; The loopback watchdog must stay above the sum of the per-case bounds its
-   ;; slowest property can spend. server/request-backpressure allows 45 s per
-   ;; case over 20 cases (see backpressure-timeout-ms and the measurements it
-   ;; cites), so a 600 s outer bound could expire before the property itself
-   ;; reported anything — turning a diagnosable per-case failure into an opaque
-   ;; scenario timeout.
+   ;; Keep the group watchdog above the sum of the bounded real-socket
+   ;; properties so an individual property reports its own failure rather than
+   ;; being replaced by an opaque scenario timeout. request-backpressure is
+   ;; back on the shared 8 s per-case bound (20 cases) now that the monotonic
+   ;; wake-cursor repair removed the 1 s re-arm stalls.
    ["loopback properties"  test-loopback-properties  960000]])
 
 (defn -main [& args]
