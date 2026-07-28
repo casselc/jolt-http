@@ -59,10 +59,10 @@
 ;; failure total and exits at the end, so a single red property must not abort
 ;; the rest of the run.
 ;;
-;; The reporter adds what the default cannot know about this fixture: the
-;; out-of-band `events` log, which is the only record of what happened in a run
-;; that libhegel flagged as nondeterministic (those come back with no
-;; counterexample at all).
+;; The reporter adds the fixture's out-of-band `events` log and preserves
+;; jolt-hegel's bounded `:observed-failures`. A nondeterministic run can come
+;; back without a counterexample, but the latter still records structured
+;; throwable summaries from the cases that failed during exploration.
 ;; NOTE ON THE :error BRANCH. hegel.report/run! publishes a thrown setup,
 ;; health-check or engine error under :exception. This reporter destructured
 ;; :error, which is never present on that event, so every engine error printed
@@ -87,6 +87,7 @@
                (when (:error result) (println "   error:   " (pr-str (:error result))))
                (println "   failures:" (pr-str (:n-failures result)))
                (println "   detail:  " (pr-str (:failures result)))
+               (println "   throwables:" (pr-str (:observed-failures result)))
                (println "   observed:" (pr-str (frequencies (map first @events))))
                (println "   first:   " (pr-str (first @events))))
     :error (do (println "FAIL " description "(engine/setup error)")
