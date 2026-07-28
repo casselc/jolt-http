@@ -302,16 +302,17 @@ candidate rows. Because libhegel 0.30.1 publishes no Darwin/x86_64 asset, the
 Intel job builds its exact tagged source and supplies the resulting library
 explicitly.
 
-Every POSIX lane runs with `JOLT_HEGEL_REQUIRED=1`, matching the Windows lane.
+Every POSIX lane runs with `JOLT_HEGEL_REQUIRED=1`, matching both Windows lanes.
 Installing libhegel is not the same as requiring it: a missing library already
 aborts the run at namespace load, but the flag additionally refuses to report
 success for a run that loaded libhegel and then executed no generative cases at
 all.
 
-Windows x86_64 has observed native runtime evidence for the complete
-real-loopback suite. The pinned jolt-tcp revision ships a reviewed Windows
-readiness backend and public client, so the former portable-only caveat no
-longer applies and **no runtime or socket group is skipped on this target**.
+Windows x86_64 **and Windows aarch64** both have observed native runtime
+evidence for the complete real-loopback suite. The pinned jolt-tcp revision
+ships reviewed Winsock readiness backends and a public client for both
+architectures, so the former portable-only caveat no longer applies and **no
+runtime or socket group is skipped on either target**.
 
 Two lanes run there. The first is a dependency-free HTTP runtime gate
 (`-M:windows-runtime-test`) that declares no `:extra-deps`, so real Windows
@@ -325,13 +326,24 @@ directly via the runtime's `host\chez\cli.ss` and never routes execution through
 bash. See [docs/runtime/windows-http-runtime.md](docs/runtime/windows-http-runtime.md)
 for the observed evidence and the pins it was taken against.
 
-Windows aarch64 has a separate non-gating public-preview lane on
-`windows-11-vs2026-arm`. It builds native `tarm64nt` Chez 10.4.1 and runs the
-descriptor-independent RFC-1123 date and status-reason tests in source mode.
-Because jolt-net's ARM64 probe has not yet been reviewed into a descriptor, the
-lane also requires its transport dependency to fail closed; it does not load
-the HTTP/TCP server graph or claim HTTP-over-Winsock support. It uses no
-packaged joltc, devboot, or AOT cache.
+Windows aarch64 runs the **same two lanes, and gates on both**, on
+`windows-11-vs2026-arm`. It builds official Chez 10.4.1 from source, asserts
+`runner.arch == ARM64` and Chez `(machine-type) == tarm64nt`, then runs the same
+dependency-free real-loopback gate and the same `JOLT_HEGEL_REQUIRED=1` suite as
+x86-64 — the same 55 scenario groups, the same 8 tests / 68 assertions, and the
+same 316 checks. No runtime or socket group is skipped on either architecture.
+
+The earlier non-gating preview, which opened no socket and asserted that the
+transport failed closed with `:unsupported-target`, is gone: the pinned jolt-tcp
+revision reaches a jolt.net carrying reviewed Winsock readiness for aarch64 as
+well as x86-64. The architecture is declared by the runner through
+`JOLT_EXPECTED_ARCH` and asserted as an exact `[:windows :aarch64 64]` target,
+never inferred from the running process, so an emulated x86-64 Jolt fails before
+any HTTP test can pass.
+
+Both Windows architectures are **source-runtime** evidence only: native Chez,
+source-mode Jolt, `JOLT_AOT_CACHE=0`. Neither uses a packaged joltc, a devboot,
+or an AOT cache, and neither is evidence for those.
 
 Runs a framework-less acceptance suite plus three generative layers
 ([jolt-hegel][]) over real loopback TCP, driving raw
@@ -359,10 +371,12 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
   -M:test "pipelining" "keep-alive"
 ```
 
-The current reviewed core baseline is the upstream-v0.5.4 rebase at
-`89fe46e8a826b60b69d264fab76c864881055830`. `deps.edn` pins jolt-tcp at
-`f0e73381e4e715e10a0e07cc1e93227026d7bb3b`, which transitively pins jolt-net
-at `bd9865c3e6c73f8ec3dcfad8c00f718bd1973c46`.
+The current reviewed core baseline is
+`46e1f74fc14f29283586900ef4b98c45375c0500`, held in a single `JOLT_CORE_SHA`
+workflow variable so no platform can validate against a different core.
+`deps.edn` pins jolt-tcp at `e27d5c7152d5746b96382587a084c4f2001f3cb6`, which
+transitively pins jolt-net at `c3747385235df812e0d739a3e9f71c4dfb07b474`;
+jolt-net is never declared directly at the HTTP layer.
 
 Progress is also written to the absolute
 `jolt-http-test-progress.log` path under the platform temp directory

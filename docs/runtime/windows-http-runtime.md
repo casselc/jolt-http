@@ -1,26 +1,40 @@
-# Native Windows HTTP runtime evidence (W6B)
+# Native Windows HTTP runtime evidence (W6B, W8)
 
 This records what was actually observed while promoting jolt-http from
 portable-only Windows coverage to real loopback HTTP runtime coverage over the
-reviewed W6A jolt-tcp public API, and the two platform findings that came out of
-it. It is evidence, not a support matrix: every claim below names the pins it
-was taken against.
+reviewed jolt-tcp public API — first on x86-64 (W6B), then on ARM64 (W8) — and
+the platform findings that came out of it. It is evidence, not a support matrix:
+every claim below names the pins it was taken against.
 
-## Pins
+All Windows evidence here is **source-runtime** evidence: native Chez, source-mode
+Jolt, `JOLT_AOT_CACHE=0`. No lane on this platform uses a packaged `joltc`, a
+devboot, or an AOT cache, and none of the results below should be read as
+evidence for those.
+
+## Pins (W8)
 
 | Component | Pin |
 | --- | --- |
-| jolt-http base | `9a87db5607bfe1eb0cca6865a292832afb49f8a7` (`codex/jolt-upstream-fork`) |
-| jolt-tcp (W6A, reviewed) | `6a311ea8242c867f906ce164bd39d7f33a499a3f` |
-| jolt-net (transitive, via jolt-tcp) | `a4a4deb6b757d5e86aeb941cf646927e21420df6` |
-| Jolt core (every CI and runtime checkout) | `85f645aa1178e4b631198dcbaf46bdad1283750b` |
-| jolt-hegel (test-time only) | `e03127174bcaea4ffa1c0cef11bde0efa009e9dc` |
+| jolt-http | `65c4ddbf05ec0fcaf0370aa309604aa39bd186d7` (`claude/windows-arm64-http-runtime`) |
+| jolt-http base | `2f877462363e7979b67353d52694fba5e0b9c3fb` (`claude/http-backpressure-bound-restore`) |
+| jolt-tcp | `e27d5c7152d5746b96382587a084c4f2001f3cb6` |
+| jolt-net (transitive, via jolt-tcp) | `c3747385235df812e0d739a3e9f71c4dfb07b474` |
+| Jolt core (every CI and runtime checkout) | `46e1f74fc14f29283586900ef4b98c45375c0500` |
+| jolt-hegel (test-time only) | `defab7f4385bf9409cae8e512defa3d60c8d926a` (`chucklehead-dev/jolt-hegel`) |
 | libhegel | 0.30.1 |
 | Chez Scheme | 10.4.1 |
 
-Native toolchain used for the Windows observations: `D:\chez-10.4.1\bin\scheme.exe`
-with the Jolt runtime at `D:\src\jolt-proposal-net-runtime-w3` (itself at Jolt
-`85f645aa`), driven from native PowerShell by `tools/test-windows-source.ps1`.
+The Jolt core revision is held in a single `JOLT_CORE_SHA` workflow variable
+rather than repeated per job, so a platform cannot silently validate against a
+different core.
+
+jolt-net is reached **only** transitively through jolt-tcp; jolt-http declares no
+direct dependency on it. `c3747385` is the revision jolt-tcp `e27d5c7` actually
+pins, and therefore the one every result below was produced against. It is not
+the tip of jolt-net's reviewed branch.
+
+The W6B-era observations were originally taken on a local toolchain. Everything
+recorded here now comes from hosted CI, named by run and job ID at each claim.
 
 ## Layering
 
@@ -36,23 +50,29 @@ poller really opens on the target.
 
 | Lane | Result |
 | --- | --- |
+| Windows **aarch64**, `-M:windows-runtime-test` (dependency-free) | 8 tests, 68 assertions, 0 failures, 0 errors — exit 0 |
+| Windows **aarch64**, `-M:test` with `JOLT_HEGEL_REQUIRED=1` | 316 checks, 0 failures — exit 0 |
 | Windows x86-64, `-M:windows-runtime-test` (dependency-free) | 8 tests, 68 assertions, 0 failures, 0 errors — exit 0 |
 | Windows x86-64, `-M:test` with `JOLT_HEGEL_REQUIRED=1` | 316 checks, 0 failures — exit 0 |
 | Linux x86-64, `-M:test` with `JOLT_HEGEL_REQUIRED=1` | 316 checks, 0 failures — exit 0 |
 | Linux x86-64, `-M:test` with the flaky witness seed | 316 checks, 0 failures; 6/6 clean replays of the loopback group |
 
-The dependency-free gate reports the same 68 assertions on Linux and on native
-Windows, so the two platforms are running the same contracts.
+Both Windows architectures report the **same** numbers: 8 tests / 68 assertions
+in the dependency-free gate, and 316 checks in the full suite, across an
+identical set of 55 scenario groups. No runtime or socket group is skipped on
+either target.
 
-The full suite runs the same 55 scenarios on Windows x86-64 as on Linux, so no
-runtime or socket group is skipped on that target.
+Exit codes are observed, not inferred. `tools/test-windows-source.ps1`
+materializes the child process handle before reading `.ExitCode`, refuses to
+report success when no exit code is available, and propagates a nonzero one — so
+a green step means a real child exit code of 0 was read.
 
-Hosted CI on this branch (`casselc/jolt-http`, workflow `tests`) has been
-observed green across all six lanes — Linux x86-64, Linux aarch64, macOS arm64,
-macOS x86-64, Windows x86-64 and the non-gating Windows ARM64 preview.
-Windows ARM64 is a preview lane only and claims no socket-runtime support.
+Hosted CI on `casselc/jolt-http` (workflow `tests`, run
+[`30323400505`](https://github.com/casselc/jolt-http/actions/runs/30323400505),
+revision `65c4ddb`) is green across all six lanes — Linux x86-64, Linux aarch64,
+macOS arm64, macOS x86-64, Windows x86-64 and Windows aarch64. **All six gate.**
 
-Every POSIX lane and the Windows x86-64 suite run with `JOLT_HEGEL_REQUIRED=1`.
+Every POSIX lane and both Windows suites run with `JOLT_HEGEL_REQUIRED=1`.
 That flag is not what makes a missing libhegel fail — `hegel.ffi` loads the
 native library eagerly, so an absent library aborts at namespace load with
 `:hegel.ffi/library-load-failed` and a non-zero exit, which was verified
@@ -118,8 +138,9 @@ before it re-enters `net/await-ready`, the connection is only re-serviced on the
 next tick of that 1000 ms wait. jolt-http's fixture merely amplifies it, because
 a 1 KB read buffer over a 93 KB body is ~92 exposures per case.
 
-**It is not observed on native Windows x86-64 at all** — the same property
-completes 20 generated cases in ~1.4 s there.
+**It is not observed on native Windows at all**, on either architecture — the
+same property completes its 20 generated cases in ~1.4 s on x86-64 and in
+1804 ms on aarch64 (run `30323400505`).
 
 ### Disposition
 
@@ -284,44 +305,74 @@ supersedes in-flight runs.
 Observed: Windows ARM64 7m19s → 1m21s, Windows x86-64 9m12s → 2m32s, macOS
 x86-64 13m03s → ~4m; full-matrix wall clock ~13 min → ~3.5 min.
 
-## Windows ARM64 — preview observed, boundary unchanged
+## Windows ARM64 — promoted to a gating socket runtime (W8)
 
-The preview lane has now **passed on native Windows ARM64 hardware**, which it
-had not when this document was first written.
+Windows ARM64 previously ran a non-gating preview: `continue-on-error: true`,
+two descriptor-independent tests, no socket, and an assertion that
+`jolt.net.target/descriptor` still failed closed with `:unsupported-target`.
+**That boundary is gone.** The pinned jolt-tcp revision reaches a jolt.net
+carrying reviewed Winsock readiness for aarch64 as well as x86-64, so ARM64 now
+runs the same HTTP contracts and the same Hegel-required suite as x86-64, and
+gates on both.
 
 Observed evidence:
 
 | item | value |
 | --- | --- |
-| run / job | `30216650356` / `89831928101` |
-| runner | `windows-11-vs2026-arm` |
-| Chez | native `tarm64nt` 10.4.1, restored from `chez-Windows-ARM64-v10.4.1-tarm64nt-v1` |
-| entry point | `-M:windows-arm64-preview` (`jolt.http.windows-arm64-preview`) |
-| result | `Ran 2 tests. 11 assertions passed, 0 failures, 0 errors.` |
-| fail-closed assertion | `PASS portable HTTP logic with network dependency fail-closed` |
+| run / job | [`30323400505`](https://github.com/casselc/jolt-http/actions/runs/30323400505) / `90163745148` |
+| revision | `65c4ddbf05ec0fcaf0370aa309604aa39bd186d7` |
+| runner | `windows-11-vs2026-arm`; `runner.arch = ARM64`, OS architecture `ARM 64-bit Processor` |
+| Chez | native 10.4.1, `(machine-type)` asserted `tarm64nt` |
+| target assertion | `JOLT_EXPECTED_ARCH=aarch64`, gate asserts `[:windows :aarch64 64]` |
+| dependency-free gate | `-M:windows-runtime-test` — 8 tests, 68 assertions passed, 0 failures, 0 errors, exit 0 |
+| complete suite | `-M:test` with `JOLT_HEGEL_REQUIRED=1` — 316 checks, 0 failures, exit 0 |
+| libhegel | `libhegel-windows-arm64.dll` 0.30.1, downloaded and sha256-verified on the runner |
+| wall clock | 10m30s including a from-source `tarm64nt` build |
 
-The `Get-FileHash` caveat is also obsolete here and has been removed rather than
-restated: W6A hit a jolt-hegel installer blocker on this target, but this lane
-declares no jolt-hegel dependency and never invokes the installer — the CI step
-does not pass `-InstallHegel` — so that blocker is not on its path at all.
+Every generative group ran non-vacuously on ARM64:
 
-**The boundary is unchanged, and passing does not widen it.** What the lane
-proves is exactly two things: that the descriptor-independent HTTP layers really
-execute under native source-mode Jolt on ARM64, and that
-`jolt.net.target/descriptor` still fails closed with `:unsupported-target`. In
-particular this lane is and remains:
+| group | result |
+| --- | --- |
+| pure properties | `Ran 24 tests. 32 assertions passed, 0 failures, 0 errors.` |
+| protocol properties | `Ran 19 tests. 25 assertions passed, 0 failures, 0 errors.` (19 named properties, each `PROPERTY-BEGIN`/`PROPERTY-END`) |
+| loopback properties | all 8 real-TCP properties, 30/25/20/30/30/20/25/25 cases |
 
-- **non-gating** — `continue-on-error: true`;
-- **no socket runtime** — jolt.net still lacks a reviewed ARM64 descriptor, so
-  loading the HTTP/TCP server graph would correctly fail before any socket call.
-  No listener is started and no HTTP-over-Winsock support is claimed;
-- **no jolt-hegel dependency** — the alias declares no `:extra-deps`, so an
-  installer failure can never silence the fail-closed assertion;
-- **no packaged joltc, no devboot, no AOT cache claim** — it is source-mode Jolt
-  over a natively built `tarm64nt` Chez, with `JOLT_AOT_CACHE=0`.
+### What retired the two blockers
 
-The same namespace was also exercised on Linux, where it runs the portable
-selection non-vacuously and then correctly refuses the non-ARM64 target.
+Both reasons the preview existed were retired by **lower-layer** evidence
+before this lane was promoted, not by relaxing anything here:
+
+- **No reviewed ARM64 descriptor.** jolt-net `c3747385` ships reviewed Winsock
+  readiness for x86-64 and aarch64 alike. jolt-tcp `e27d5c7` pins it and is green
+  on real ARM64 loopback in run
+  [`30322363564`](https://github.com/casselc/jolt-tcp/actions/runs/30322363564).
+- **The `Get-FileHash` installer blocker.** W6A recorded a jolt-hegel installer
+  failure on Windows ARM64, and the preview sidestepped it by declaring no
+  jolt-hegel dependency. It no longer reproduces: the same jolt-tcp run installs
+  libhegel and runs its complete suite on ARM64, and this lane now does the same,
+  fetching and verifying `libhegel-windows-arm64.dll` directly.
+
+### What is asserted rather than assumed
+
+An ARM64 runner label alone would not prove a native ARM64 run, so three
+independent checks stand between the label and a green result:
+
+- `runner.arch` must equal `ARM64`;
+- Chez `(machine-type)` must equal `tarm64nt`, read with `--script` rather than
+  `--eval` so a failing probe cannot exit zero;
+- the gate itself asserts the exact `[:windows :aarch64 64]` target from
+  `JOLT_EXPECTED_ARCH`, failing closed on a missing or unknown value.
+
+The architecture is declared by the runner and never inferred from the running
+process, so an emulated x86-64 Jolt fails before the positive readiness-poller
+assertion or any HTTP test can pass.
+
+### Remaining boundaries
+
+- **Source-runtime only.** No packaged `joltc`, no devboot, no AOT cache —
+  `JOLT_AOT_CACHE=0`. Nothing here is evidence for a packaged or AOT ARM64 build.
+- The claim covers `windows-11-vs2026-arm` with official Chez 10.4.1 built from
+  source at the pins named above.
 
 ## Proof boundary
 
@@ -333,3 +384,26 @@ framing, completion, EOF, ownership and cancellation proofs in `docs/proofs/` do
 document. The two behavioural findings above were both localized *outside*
 jolt-http's production layer — one to jolt-tcp's reactor, one to TCP reset
 semantics — and neither was worked around by altering HTTP production code.
+
+The ARM64 promotion (W8) is the same kind of work and carries the same
+disposition. `src/` is byte-identical to base `2f877462363e7979b67353d52694fba5e0b9c3fb`
+(`git diff --stat 2f87746 -- src/` is empty), so no ARM-specific proof model was
+invented and none was needed. The existing HTTP, TCP and net invariants apply on
+aarch64 for a structural reason rather than by re-derivation:
+
+- jolt-http reaches the network **only** through jolt-tcp's reactor and
+  `teensyp.client`. That interface contract names no architecture, and nothing
+  under `src/` imports `jolt.net` or `jolt.ffi`.
+- The readiness contract those proofs depend on is supplied by a single reviewed
+  jolt-net revision (`c3747385`) that implements Winsock readiness for x86-64 and
+  aarch64 alike. Both Windows lanes therefore exercise the *same* contract
+  object, not two independently derived ones.
+- Native conformance is asserted rather than assumed at three levels
+  (`runner.arch`, Chez `machine-type`, and the in-test `[:windows :aarch64 64]`
+  target check), so the evidence cannot be satisfied by an emulated process.
+- The observable behaviour is identical: the same 55 scenario groups, the same
+  8 tests / 68 assertions, and the same 316 checks on both architectures.
+
+Had any HTTP semantics differed on ARM64, the obligation would have been to stop
+and identify the exact proof affected rather than to widen a platform claim. No
+such difference was observed, and no HTTP production change was made.
