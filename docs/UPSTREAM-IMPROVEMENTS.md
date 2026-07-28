@@ -7,8 +7,8 @@ upstream issue tracker.
 ## Verification baseline
 
 Revalidated 2026-07-28 against hosted CI run
-[`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304)
-(jolt-http `25af61c`), green across all six lanes:
+[`30369250255`](https://github.com/casselc/jolt-http/actions/runs/30369250255)
+(jolt-http `a920052`), green across all six lanes:
 
 - Jolt core `46e1f74fc14f29283586900ef4b98c45375c0500`, source-mode over Chez
   10.4.1 built from source on every lane — no packaged `joltc`, no AOT cache;

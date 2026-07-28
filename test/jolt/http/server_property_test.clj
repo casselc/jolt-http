@@ -643,9 +643,10 @@
                   ;; including, sometimes, the 414/431 the server did send.
                   ;;
                   ;; That is a transport fact, not an HTTP conformance fact, and
-                  ;; it is timing-dependent: native Windows x86-64 hits it
-                  ;; intermittently (seed 305835134111915440, pad-len 2048),
-                  ;; POSIX loopback almost never does. jolt.http.server-test's
+                  ;; it is timing-dependent: native Windows x86-64 exposed it
+                  ;; first (seed 305835134111915440, pad-len 2048), and hosted
+                  ;; macOS x86-64 later produced one nondeterministic outcome at
+                  ;; the same boundary. jolt.http.server-test's
                   ;; recv-until-eof already encodes exactly this reasoning for
                   ;; the acceptance scenario; the property harness did not, so
                   ;; the case surfaced as a libhegel "flaky" verdict.

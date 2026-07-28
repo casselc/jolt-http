@@ -15,7 +15,8 @@ evidence for those.
 
 | Component | Pin |
 | --- | --- |
-| jolt-http | `25af61c541a6cd4eb765faacea7bbd89eb154113` (`codex/windows-arm64-v0.5.7-integration`) |
+| jolt-http evidence tip | `a920052d04d00f21ca19bf5023bddc57b6467a26` (`codex/windows-arm64-v0.5.7-integration`) |
+| jolt-http runtime-stack pin | `25af61c541a6cd4eb765faacea7bbd89eb154113` |
 | jolt-http base | `2f877462363e7979b67353d52694fba5e0b9c3fb` (`claude/http-backpressure-bound-restore`) |
 | jolt-tcp | `911cf783d56e988adb2b8f716b6636fae5454e52` |
 | jolt-net (transitive, via jolt-tcp) | `c3747385235df812e0d739a3e9f71c4dfb07b474` |
@@ -68,9 +69,11 @@ report success when no exit code is available, and propagates a nonzero one — 
 a green step means a real child exit code of 0 was read.
 
 Hosted CI on `casselc/jolt-http` (workflow `tests`, run
-[`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304),
-revision `25af61c`) is green across all six lanes — Linux x86-64, Linux aarch64,
+[`30369250255`](https://github.com/casselc/jolt-http/actions/runs/30369250255),
+revision `a920052`) is green across all six lanes — Linux x86-64, Linux aarch64,
 macOS arm64, macOS x86-64, Windows x86-64 and Windows aarch64. **All six gate.**
+That revision differs from the runtime-stack pin only in documentation and test
+failure diagnostics; `src/` remains byte-identical.
 
 Every POSIX lane and both Windows suites run with `JOLT_HEGEL_REQUIRED=1`.
 That flag is not what makes a missing libhegel fail — `hegel.ffi` loads the
@@ -165,11 +168,11 @@ check. Both workarounds were removed at HTTP commit `8768612` after the
 lower-layer fix. The observer is again 8 s and `TooSlow` is enabled.
 
 The original witness then completed its 20 cases in 2584/2620/2768 ms, with
-every byte conserved. The final six-platform run `30365467304` executes the
+every byte conserved. The final six-platform run `30369250255` executes the
 same property at those defaults and is green. No HTTP production code changed;
 the diagnosis, repair, and proofs remain at the readiness/reactor boundary.
 
-## Finding 2 — an over-limit rejection can be RST'd on Windows
+## Finding 2 — an over-limit rejection can be RST'd before its response is observed
 
 Native Windows surfaced a second, unrelated flake in
 `server/oversize` (seed `305835134111915440`, `{:pad-len 2048, :over? true}`).
@@ -179,8 +182,8 @@ while the rest of the oversized request is still in flight. TCP answers the
 unread inbound data with a RST, and a RST discards whatever is still sitting
 unread in the client's receive queue — including, sometimes, the error response
 the server did send. This is a transport fact, not an HTTP conformance fact, and
-it is timing-dependent: native Windows hits it intermittently, POSIX loopback
-almost never does.
+it is timing-dependent. Native Windows exposed it first; hosted macOS x86-64
+later produced one nondeterministic outcome at the same property boundary.
 
 `jolt.http.server-test`'s `recv-until-eof` already encoded exactly this
 reasoning for the acceptance scenario ("the response bytes received before that
@@ -204,6 +207,24 @@ Two test-layer changes, both in `test/`:
 
 No oracle was weakened: a response that does arrive must still be well-formed
 and carry exactly the expected status.
+
+A later documentation-tip run
+[`30367230561`](https://github.com/casselc/jolt-http/actions/runs/30367230561)
+failed this property once on macOS x86-64 with seed `305835134111915440`.
+The fixture's explicit failure log was empty. The reporter also failed to print
+jolt-hegel's bounded `:observed-failures`, so that historical run cannot tell us
+whether the escaped throwable was a direct reset, a wrapped terminal error, or
+cleanup after the peer had already retired. Guessing another accepted error
+kind from that evidence would weaken the oracle without establishing the
+premise.
+
+Commit `a920052` therefore changes diagnostics only: flaky results now retain
+the structured throwable summaries jolt-hegel already captured. The exact seed
+then passed 200 consecutive Linux executions, the complete six-lane run
+`30369250255`, and two additional targeted macOS x86-64 reruns (attempts 2 and
+3 of that run). No timeout, retry, health check, status oracle, or transport
+classification changed. The residual timing risk remains recorded, and the
+next occurrence will carry the evidence needed for a narrow fix.
 
 ## Finding 3 — two POSIX-only temp paths
 
@@ -280,8 +301,8 @@ Observed evidence:
 
 | item | value |
 | --- | --- |
-| run / job | [`30365467304`](https://github.com/casselc/jolt-http/actions/runs/30365467304) / `90295465550` |
-| revision | `25af61c541a6cd4eb765faacea7bbd89eb154113` |
+| run / job | [`30369250255`](https://github.com/casselc/jolt-http/actions/runs/30369250255) / `90308446714` |
+| revision | `a920052d04d00f21ca19bf5023bddc57b6467a26` |
 | runner | `windows-11-vs2026-arm`; `runner.arch = ARM64`, OS architecture `ARM 64-bit Processor` |
 | Chez | native 10.4.1, `(machine-type)` asserted `tarm64nt` |
 | target assertion | `JOLT_EXPECTED_ARCH=aarch64`, gate asserts `[:windows :aarch64 64]` |
@@ -381,7 +402,7 @@ W9 should:
 
 1. work in a new worktree from exact base `eebfefa`, leaving the existing
    adapter checkout and the dirty `http-client` checkout untouched;
-2. pin jolt-http `25af61c541a6cd4eb765faacea7bbd89eb154113` and Jolt core
+2. pin jolt-http `a920052d04d00f21ca19bf5023bddc57b6467a26` and Jolt core
    `46e1f74fc14f29283586900ef4b98c45375c0500`;
 3. add a dependency-free real-loopback gate driven by the public
    `teensyp.client` test surface, with port zero, the actual bound port, a
