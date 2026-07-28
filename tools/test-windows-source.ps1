@@ -18,6 +18,9 @@ param(
   [string]$ChezExe = "D:\chez-10.4.1\bin\scheme.exe",
   [string]$TestAlias = "-M:windows-runtime-test",
   [string]$GitLibsPath = "",
+  [string]$ShellExe = "",
+  [ValidateSet("x86-64", "aarch64")]
+  [string]$ExpectedArch = "x86-64",
   [switch]$InstallHegel,
   [switch]$HegelRequired,
   [int]$TimeoutSeconds = 300
@@ -38,14 +41,6 @@ if (-not $TestAlias.StartsWith("-M:")) {
   throw "test-windows-source.ps1: TestAlias must be a -M: alias"
 }
 
-$env:JOLT_PWD = $JoltHttpPath
-$env:JOLT_AOT_CACHE = "0"
-$env:JOLT_VERSION = "dev"
-
-if ($HegelRequired) {
-  $env:JOLT_HEGEL_REQUIRED = "1"
-}
-
 # JOLT_SH is required by Jolt's DEPENDENCY TOOLING, not by test execution.
 # Scoping it to the libhegel install phase was tried first and fails earlier
 # than that: every alias resolves the git graph, and Jolt derives a git cache
@@ -57,9 +52,44 @@ if ($HegelRequired) {
 # before a single namespace is loaded. It is therefore set for the whole run --
 # which is exactly "where dependency tooling genuinely requires it" -- and the
 # gate itself still declares no :extra-deps and makes no use of a shell.
-$env:JOLT_SH = "C:\Program Files\Git\bin\sh.exe"
-if (-not (Test-Path $env:JOLT_SH)) {
-  throw "test-windows-source.ps1: JOLT_SH not found at $env:JOLT_SH; Jolt cannot resolve git dependencies without it"
+#
+# The location is discovered rather than hardcoded. A literal
+# "C:\Program Files\Git\bin\sh.exe" is not portable across the Windows runner
+# images: %ProgramFiles% is where the native-architecture Git lands, and an
+# ARM64 image can carry an x86 Git under %ProgramFiles(x86)% instead. Prefer
+# the expanded roots, keep the literal as a last static candidate, then fall
+# back to whatever is already on PATH. -ShellExe overrides all of it.
+if ([string]::IsNullOrWhiteSpace($ShellExe)) {
+  $candidates = @(
+    "$env:ProgramFiles\Git\bin\sh.exe",
+    "${env:ProgramFiles(x86)}\Git\bin\sh.exe",
+    "C:\Program Files\Git\bin\sh.exe"
+  ) | Where-Object { $_ -and (Test-Path $_) }
+  if ($candidates) {
+    $ShellExe = $candidates[0]
+  }
+  else {
+    $command = Get-Command sh -ErrorAction SilentlyContinue
+    if ($command) {
+      $ShellExe = $command.Source
+    }
+  }
+}
+if ([string]::IsNullOrWhiteSpace($ShellExe) -or -not (Test-Path $ShellExe)) {
+  throw "test-windows-source.ps1: sh.exe not found; pass -ShellExe explicitly"
+}
+
+$env:JOLT_PWD = $JoltHttpPath
+$env:JOLT_AOT_CACHE = "0"
+$env:JOLT_VERSION = "dev"
+$env:JOLT_SH = (Resolve-Path $ShellExe).Path
+# The gate asserts this against the architecture it actually observes, so a
+# mismatched or emulated runtime fails closed instead of quietly certifying the
+# wrong target.
+$env:JOLT_EXPECTED_ARCH = $ExpectedArch
+
+if ($HegelRequired) {
+  $env:JOLT_HEGEL_REQUIRED = "1"
 }
 
 # Jolt derives its git cache from $HOME and falls back to a RELATIVE "./.jolt"
@@ -126,6 +156,8 @@ Write-Host "  JOLT_PWD = $env:JOLT_PWD"
 Write-Host "  runtime  = $RuntimePath"
 Write-Host "  scheme   = $ChezExe"
 Write-Host "  alias    = $TestAlias"
+Write-Host "  arch     = $env:JOLT_EXPECTED_ARCH"
+Write-Host "  sh       = $env:JOLT_SH"
 Write-Host "  gitlibs  = $env:JOLT_GITLIBS"
 Write-Host "  hegel    = $InstallHegel (required=$HegelRequired)"
 Write-Host ""

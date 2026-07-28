@@ -2,6 +2,11 @@ name: tests
 
 on: [push, pull_request, workflow_dispatch]
 
+env:
+  # One reviewed fork revision for every source-mode lane. Keep this centralized
+  # so a platform cannot silently validate against a different core.
+  JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+
 # Supersede an in-flight run for the same ref. Without this, pushing twice in
 # quick succession leaves both runs racing: every toolchain cache is written at
 # the END of a job, so concurrent runs all miss the cache the others are about
@@ -123,7 +128,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 89fe46e8a826b60b69d264fab76c864881055830
+          ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
           path: jolt
 
@@ -284,7 +289,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 89fe46e8a826b60b69d264fab76c864881055830
+          ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
           path: jolt
 
@@ -300,6 +305,7 @@ jobs:
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
             -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ExpectedArch 'x86-64' `
             -TestAlias '-M:windows-runtime-test' `
             -TimeoutSeconds 900
 
@@ -312,31 +318,47 @@ jobs:
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
             -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ExpectedArch 'x86-64' `
             -TestAlias '-M:test' `
             -InstallHegel `
             -HegelRequired `
             -TimeoutSeconds 2400
 
-# Windows ARM64 has no reviewed jolt.net descriptor yet. This public-preview
-# lane therefore runs only the explicit descriptor-independent HTTP tests and
-# verifies that the transport dependency fails closed. It is native source-mode
-# Jolt over tarm64nt Chez: no packaged joltc, devboot, AOT cache, HTTP listener,
-# or Winsock runtime claim.
-  windows-arm64-source-preview:
-    name: source-mode HTTP preview (Windows aarch64; non-AOT, no sockets)
+# Windows ARM64 runs the SAME real-loopback HTTP suite as Windows x86-64, and
+# gates on it. The former lane here was a non-gating, socket-free preview that
+# asserted jolt.net still failed closed with :unsupported-target; the pinned
+# jolt-tcp revision reaches a jolt.net carrying reviewed Winsock readiness for
+# aarch64 as well as x86-64, so that premise is gone and the preview with it.
+#
+# Source-runtime evidence only: official native tarm64nt Chez 10.4.1, AOT cache
+# disabled, no packaged joltc and no devboot claim. The exact target check in
+# windows-runtime-test makes an emulated x86-64 Jolt process fail before the
+# positive poller assertion or any HTTP test can pass.
+  windows-arm64-runtime:
+    name: HTTP runtime suite (Windows aarch64; real loopback)
     runs-on: windows-11-vs2026-arm
-    timeout-minutes: 35
-    continue-on-error: true
+    timeout-minutes: 60
     env:
       JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
     steps:
       - name: Checkout jolt-http
         uses: actions/checkout@v4
 
-      # This lane previously had no cache at all and rebuilt tarm64nt Chez from
-      # source on every run (~7 min) to execute a handful of descriptor-
-      # independent tests. Only the built output is cached; the checkout below
-      # is skipped on a hit, so nothing is cloned either.
+      # The runner label is the only thing selecting this hardware, and a stale
+      # or remapped label would otherwise silently downgrade the whole lane to
+      # an x86-64 run wearing an ARM64 name.
+      - name: Assert the runner is ARM64
+        shell: pwsh
+        run: |
+          Write-Host "runner.arch      = ${{ runner.arch }}"
+          Write-Host "PROCESSOR_ARCH   = $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "OS architecture  = $((Get-CimInstance Win32_OperatingSystem).OSArchitecture)"
+          if ('${{ runner.arch }}' -ne 'ARM64') {
+            throw "expected an ARM64 runner, got '${{ runner.arch }}'"
+          }
+
+      # Only the built output is cached; the checkout below is skipped on a hit,
+      # so nothing is cloned either.
       - name: Restore native ARM64 Chez Scheme
         id: cache-chez-arm64
         uses: actions/cache/restore@v4
@@ -359,17 +381,21 @@ jobs:
         shell: cmd
         run: |
           cd /d "%GITHUB_WORKSPACE%\chez-arm64"
-          call build.bat tarm64nt /only
+          call build.bat tarm64nt /only || exit /b 1
 
       - name: Checkout pinned Jolt core
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: 89fe46e8a826b60b69d264fab76c864881055830
+          ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
           path: jolt
 
-      - name: Assert native ARM64 Chez for source-mode Jolt
+      # Version alone cannot distinguish a native tarm64nt build from an
+      # emulated ta6nt one, so assert (machine-type) too. It is read with
+      # --script rather than --eval: --eval does not exit nonzero on a failed
+      # expression here, which would let a bad probe report success.
+      - name: Assert native ARM64 Chez v10.4.1
         shell: pwsh
         run: |
           $scheme = Join-Path $env:GITHUB_WORKSPACE `
@@ -377,15 +403,28 @@ jobs:
           if (-not (Test-Path $scheme)) {
             throw "native ARM64 Chez executable not found: $scheme"
           }
-          $version = (& $scheme --version | Out-String)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host $version
+          $version = (& $scheme --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "scheme.exe --version exited $LASTEXITCODE"
+          }
+          Write-Host "chez version: $version"
           if (-not $version.Contains('10.4.1')) {
             throw "expected Chez Scheme 10.4.1, got: $version"
           }
+          $probe = Join-Path $env:RUNNER_TEMP 'machine-type.ss'
+          Set-Content -Path $probe -Value '(display (machine-type))(newline)'
+          $machine = (& $scheme --script $probe | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "scheme.exe --script exited $LASTEXITCODE"
+          }
+          Write-Host "chez machine-type: $machine"
+          if ($machine -ne 'tarm64nt') {
+            throw "expected Chez machine-type tarm64nt, got '$machine'"
+          }
+          echo "JOLT_HTTP_CHEZ=$scheme" >> $env:GITHUB_ENV
 
-      # Saved only after the build above has been asserted good, and before the
-      # preview runs, so a red preview cannot cost the next run a full rebuild.
+      # Saved after the build is asserted good and before any test runs, so a
+      # red gate cannot cost the next run a full rebuild.
       - name: Save native ARM64 Chez Scheme
         if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -393,18 +432,29 @@ jobs:
           path: chez-arm64/tarm64nt
           key: ${{ steps.cache-chez-arm64.outputs.cache-primary-key }}
 
-      # One checked-in main covers both preview claims: the descriptor-independent
-      # HTTP tests actually run on native ARM64, AND jolt.net still fails closed
-      # with :unsupported-target before its reviewed ARM64 descriptor exists. It
-      # declares no jolt-hegel dependency, so W6A's Windows ARM64 jolt-hegel
-      # installer/Get-FileHash blocker cannot silence the fail-closed assertion.
-      # This lane is continue-on-error and claims NO socket-runtime support.
-      - name: Run the descriptor-independent HTTP preview (fail-closed transport)
+      # Runs FIRST and declares no :extra-deps, exactly as on x86-64. Real
+      # Windows HTTP socket coverage must not be able to disappear because
+      # jolt-hegel failed to resolve or install.
+      - name: Run dependency-free HTTP runtime contracts (real loopback)
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe" `
-            -TestAlias '-M:windows-arm64-preview' `
-            -TimeoutSeconds 600
+            -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ExpectedArch 'aarch64' `
+            -TestAlias '-M:windows-runtime-test' `
+            -TimeoutSeconds 900
+
+      - name: Install libhegel and run the complete test suite
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
+            -JoltHttpPath "$env:GITHUB_WORKSPACE" `
+            -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
+            -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ExpectedArch 'aarch64' `
+            -TestAlias '-M:test' `
+            -InstallHegel `
+            -HegelRequired `
+            -TimeoutSeconds 2400

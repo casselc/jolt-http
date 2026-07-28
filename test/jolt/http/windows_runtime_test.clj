@@ -1,13 +1,19 @@
 (ns jolt.http.windows-runtime-test
-  "Native Windows x86-64 HTTP runtime gate for jolt-http.
+  "Native Windows HTTP runtime gate for jolt-http, on x86-64 and aarch64.
 
   Replaces the former portable-only Windows coverage, whose Windows claim was
   limited to the pure date/status/protocol layers because jolt.net had no
-  Windows readiness backend. The pinned jolt-tcp W6A revision ships a reviewed
-  Windows backend and a public client, so this gate instead requires a real
-  loopback HTTP server: a port-zero listen, real request/response, keep-alive
-  and pipelining, a request body large enough to force reader backpressure, a
-  half-close that is still answered, and a deterministic stop.
+  Windows readiness backend. The pinned jolt-tcp revision ships reviewed
+  Winsock readiness backends and a public client for both architectures, so
+  this gate instead requires a real loopback HTTP server: a port-zero listen,
+  real request/response, keep-alive and pipelining, a request body large enough
+  to force reader backpressure, a half-close that is still answered, and a
+  deterministic stop.
+
+  One gate serves both targets. The architecture is not inferred from the
+  running process; the runner declares it through JOLT_EXPECTED_ARCH and this
+  gate asserts the exact `[:windows <arch> 64]` target before opening a socket,
+  so an emulated x86-64 process on an ARM64 runner fails before it can pass.
 
   Deliberately dependency-free. It requires only the production namespaces,
   jolt-tcp's public client and `clojure.test` — never jolt-hegel and never an
@@ -455,12 +461,25 @@
        (sort-by #(str (:name (meta %))))))
 
 (defn -main [& _]
-  (let [observed (jolt.host/target)]
-    (when-not (= [:windows :x86-64 64]
+  (let [observed (jolt.host/target)
+        ;; The caller names the architecture it believes it provisioned, and
+        ;; this gate refuses to run against anything else. Fail closed on a
+        ;; missing or unrecognized value: an unset variable must not silently
+        ;; degrade into "whatever this process happens to be", which is exactly
+        ;; how an emulated x86-64 Jolt would pass itself off as native ARM64.
+        expected-name (System/getenv "JOLT_EXPECTED_ARCH")
+        expected-arch (case expected-name
+                        "x86-64" :x86-64
+                        "aarch64" :aarch64
+                        (throw
+                         (ex-info "JOLT_EXPECTED_ARCH must be x86-64 or aarch64"
+                                  {:observed expected-name})))]
+    (when-not (= [:windows expected-arch 64]
                  [(:os observed) (:arch observed) (:pointer-bits observed)])
       (throw
-       (ex-info "Windows HTTP runtime gate did not run on native Windows x86-64"
-                {:target observed})))
+       (ex-info "Windows HTTP runtime gate did not run on the expected native target"
+                {:expected [:windows expected-arch 64]
+                 :target observed})))
 
     ;; A readiness poller must really open here. The predecessor Windows lane
     ;; asserted the opposite, so keeping an explicit positive check makes the

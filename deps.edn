@@ -9,7 +9,7 @@
 
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "f0e73381e4e715e10a0e07cc1e93227026d7bb3b"}}
+         :git/sha "e27d5c7152d5746b96382587a084c4f2001f3cb6"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public
@@ -21,7 +21,7 @@
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.chucklehead-dev/jolt-hegel
                                {:git/url "https://github.com/chucklehead-dev/jolt-hegel.git"
-                                :git/sha "e03127174bcaea4ffa1c0cef11bde0efa009e9dc"}}
+                                :git/sha "defab7f4385bf9409cae8e512defa3d60c8d926a"}}
                   :main-opts ["-m" "jolt.http.server-test"]}
 
            ;; Checked-in mains avoid Jolt's currently POSIX-only stdin path on
@@ -31,16 +31,13 @@
            ;; Windows HTTP socket coverage must not be able to disappear because
            ;; an optional test dependency failed to resolve or install; the
            ;; Hegel-required suite is the separate :test lane.
+           ;;
+           ;; One alias serves both Windows architectures. The pinned jolt-tcp
+           ;; revision reaches a jolt.net that ships reviewed Winsock readiness
+           ;; for x86-64 and aarch64 alike, so the gate is selected by the
+           ;; JOLT_EXPECTED_ARCH the runner declares, not by a separate lane.
            :windows-runtime-test
            {:extra-paths ["test"]
-            :main-opts ["-m" "jolt.http.windows-runtime-test"]}
-
-           ;; Windows ARM64 preview: descriptor-independent HTTP logic only.
-           ;; jolt.net has no reviewed ARM64 descriptor, so no socket runtime is
-           ;; claimed and no jolt-hegel dependency is declared -- W6A recorded a
-           ;; jolt-hegel installer/Get-FileHash blocker on that target.
-           :windows-arm64-preview
-           {:extra-paths ["test"]
-            :main-opts ["-m" "jolt.http.windows-arm64-preview"]}}
+            :main-opts ["-m" "jolt.http.windows-runtime-test"]}}
 
  :tasks {test "jolt -M:test"}}
