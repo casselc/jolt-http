@@ -1,17 +1,50 @@
+# jolt-http tests.
+#
+# Chez Scheme is no longer built from source anywhere in this repository. Every
+# one of the six lanes installs the SAME immutable, checksum-pinned toolchain
+# release (chez-ci-10.4.1.1) through casselc/jolt-toolchains/setup-chez, pinned
+# by full commit SHA and requested with an explicit per-target archive SHA-256.
+# The action verifies the archive digest, its descriptor, its internal manifest,
+# the extracted inventory, and the `source-runtime` capability before exporting
+# the executable each lane then uses by exact path. A digest mismatch fails the
+# job; there is deliberately no source-build fallback, because a fallback would
+# convert a supply-chain failure into a slow green run.
+#
+# `source-runtime` is the honest capability boundary for jolt-http: the suites
+# run Clojure-on-Chez through the source Jolt launcher and link nothing against
+# the Chez kernel, so the GNU kernel-development inputs (scheme.h, libkernel.a,
+# a cc shim) that the old MSYS2 Windows lane staged are not requested. AOT stays
+# disabled on the Windows lanes exactly as before -- tools/test-windows-source.ps1
+# sets JOLT_AOT_CACHE=0 -- so nothing here needs a C toolchain either.
+#
+# What this replaced, per lane: the POSIX matrix cloned cisco/ChezScheme and ran
+# configure/make/make install behind a hand-rolled actions/cache entry; Windows
+# x86-64 did the same under an MSYS2 MINGW64 toolchain; Windows ARM64 ran
+# build.bat tarm64nt over a full ChezScheme checkout. Each cache was keyed by a
+# string nothing verified, so a restored toolchain was trusted purely because
+# its key matched. None of that remains.
+#
+# Nothing about coverage changed. All six lanes, their HTTP/runtime/property
+# groups, their timeouts, their Hegel-required gates, and the Windows
+# architecture witnesses are exactly as they were.
+
 name: tests
 
 on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
 
 env:
   # One reviewed fork revision for every source-mode lane. Keep this centralized
   # so a platform cannot silently validate against a different core.
   JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+  # One immutable toolchain release for all six targets. The per-target archive
+  # digests live next to each target below so a wrong pairing cannot pass.
+  CHEZ_RELEASE_TAG: chez-ci-10.4.1.1
 
 # Supersede an in-flight run for the same ref. Without this, pushing twice in
-# quick succession leaves both runs racing: every toolchain cache is written at
-# the END of a job, so concurrent runs all miss the cache the others are about
-# to populate and each rebuilds Chez from source. That cost 9m28s on macOS
-# x86_64 alone in one observed run, for a commit that was already superseded.
+# quick succession leaves both runs racing for the same toolchain cache entries.
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
@@ -26,106 +59,88 @@ jobs:
         include:
           - name: Linux x86_64
             runner: ubuntu-24.04
+            toolchain: linux-x86_64
+            chez_sha256: 16476cd98fb5cb2e2c0285e88fcd6d57ade9392ca8d7cf603ca38432b4118526
           - name: Linux aarch64
             runner: ubuntu-24.04-arm
+            toolchain: linux-aarch64
+            chez_sha256: b5b2306d3d6468b5fc7d5836721b09c704c7750f887a6232f1aeeb567d55f5d9
           - name: macOS arm64
             runner: macos-14
+            toolchain: macos-arm64
+            chez_sha256: d5b5a504eed1e0f117b4a3dd23ad0030bb3e5c0da6d6b9d9f990f5f2fa32478f
           - name: macOS x86_64
             runner: macos-15-intel
+            toolchain: macos-x86_64
+            chez_sha256: e4577ad71b1f1e1062c361fa612af60d75378e64dc2869d8c8eefd3d7efdbc62
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install source-build dependencies (Linux)
+      # Only what the suite actually RUNS with. The former build-essential /
+      # liblz4-dev / zlib1g-dev / libncurses-dev / uuid-dev / libssl-dev and
+      # brew lz4 / openssl@3 sets existed solely to compile Chez from source,
+      # and nothing here compiles Chez any more. zstd is the one genuine
+      # addition: the POSIX toolchain archives are .tar.zst, so tar needs a zstd
+      # it can reach. It is installed only when absent, so a runner image that
+      # already ships it pays nothing.
+      - name: Ensure zstd is available (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev \
-            libncurses-dev uuid-dev libssl-dev
+          set -euo pipefail
+          if command -v zstd >/dev/null 2>&1; then
+            echo "zstd already present: $(command -v zstd)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          fi
 
-      - name: Install source-build dependencies (macOS)
+      - name: Ensure zstd is available (macOS)
         if: runner.os == 'macOS'
-        run: brew install lz4 openssl@3
-
-      # restore/save rather than actions/cache, deliberately. actions/cache only
-      # writes its cache in a post-job step, which is SKIPPED when the job
-      # fails — so a lane whose tests are red can never populate its toolchain
-      # cache and rebuilds Chez from source on every iteration. That is exactly
-      # what happened on Windows x86_64: 6m46s of Chez rebuild per run, for a
-      # ~90s test suite, on every attempt until the suite went green.
-      #
-      # The matching save steps run immediately after Chez is asserted good and
-      # BEFORE any test step, so the cache is populated by a validated build and
-      # a test failure cannot suppress it.
-      - name: Restore Chez Scheme (Linux)
-        if: runner.os == 'Linux'
-        id: cache-chez-linux
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/chez
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
-
-      - name: Build official Chez Scheme v10.4.1 from source (Linux)
-        if: runner.os == 'Linux' && steps.cache-chez-linux.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch v10.4.1 \
-            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
-          cd "$RUNNER_TEMP/chez-src"
-          ./configure --installprefix="$HOME/chez" --threads --disable-x11
-          make -j"$(nproc)"
-          make install
+          if command -v zstd >/dev/null 2>&1; then
+            echo "zstd already present: $(command -v zstd)"
+          else
+            brew install zstd
+          fi
 
-      - name: Restore Chez Scheme (macOS)
-        if: runner.os == 'macOS'
-        id: cache-chez-macos
-        uses: actions/cache/restore@v4
+      # The immutable, digest-pinned toolchain. Replaces the source clone, the
+      # configure/make build, and the restore/save cache pair that used to guard
+      # it. The action caches the exact validated archive itself, keyed by
+      # release tag, target, and digest -- and it saves that cache in a step of
+      # its own rather than a post-job hook, so the reason this repository hand
+      # rolled restore/save (a red suite skipping the post-job save and paying
+      # for a full rebuild on every iteration) no longer applies.
+      - name: Install the verified Chez toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3 # chez-ci-10.4.1.1
         with:
-          path: ~/chez
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-x11off-v1
+          target: ${{ matrix.toolchain }}
+          release-tag: ${{ env.CHEZ_RELEASE_TAG }}
+          sha256: ${{ matrix.chez_sha256 }}
+          capabilities: source-runtime
 
-      - name: Build official Chez Scheme v10.4.1 from source (macOS)
-        if: runner.os == 'macOS' && steps.cache-chez-macos.outputs.cache-hit != 'true'
+      - name: Assert official Chez v10.4.1
         shell: bash
+        env:
+          CHEZ_EXE: ${{ steps.chez.outputs.executable }}
+          CHEZ_TARGET: ${{ steps.chez.outputs.target }}
+          CHEZ_ARCHIVE_SHA256: ${{ steps.chez.outputs.archive-sha256 }}
+          CHEZ_CACHE_HIT: ${{ steps.chez.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch v10.4.1 \
-            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
-          cd "$RUNNER_TEMP/chez-src"
-          ./configure --installprefix="$HOME/chez" --threads --disable-x11
-          make -j"$(sysctl -n hw.ncpu)"
-          make install
-
-      - name: Provide and assert official Chez v10.4.1
-        shell: bash
-        run: |
-          set -euo pipefail
-          bindir="$HOME/chez/bin"
-          test -x "$bindir/scheme"
-          printf '#!/bin/sh\nexec %s "$@"\n' "$bindir/scheme" > "$bindir/chez"
-          chmod +x "$bindir/chez"
-          echo "$bindir" >> "$GITHUB_PATH"
-          "$bindir/chez" --version | tee /tmp/chez-version
-          grep -Fq '10.4.1' /tmp/chez-version
-
-      # Saved here, not in a post-job step: Chez has just been asserted good and
-      # no test has run yet, so a red suite cannot cost the next run a rebuild.
-      - name: Save Chez Scheme (Linux)
-        if: runner.os == 'Linux' && steps.cache-chez-linux.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/chez
-          key: ${{ steps.cache-chez-linux.outputs.cache-primary-key }}
-
-      - name: Save Chez Scheme (macOS)
-        if: runner.os == 'macOS' && steps.cache-chez-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/chez
-          key: ${{ steps.cache-chez-macos.outputs.cache-primary-key }}
+          echo "target        = $CHEZ_TARGET"
+          echo "executable    = $CHEZ_EXE"
+          echo "archive sha256= $CHEZ_ARCHIVE_SHA256"
+          echo "cache hit     = ${CHEZ_CACHE_HIT:-false}"
+          test -x "$CHEZ_EXE"
+          "$CHEZ_EXE" --version 2>&1 | tee "$RUNNER_TEMP/chez-version"
+          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
 
       - name: Checkout pinned Jolt fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
@@ -137,17 +152,20 @@ jobs:
       # Only the built dylib is cached, keyed on the exact hegel-rust commit and
       # Rust toolchain, so a hit skips the clone, the rustup install and the
       # cargo build alike. Nothing else on this lane depends on the source tree.
+      #
+      # This is a libhegel concern, NOT a Chez one, and is deliberately kept as
+      # it was when the Chez source builds around it were removed.
       - name: Restore built libhegel (macOS x86_64)
         if: runner.os == 'macOS' && runner.arch == 'X64'
         id: cache-libhegel-macos
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: hegel-build
           key: libhegel-macOS-X64-0.30.1-f81c6cce-rust1.86.0-v1
 
       - name: Checkout pinned libhegel source (macOS x86_64)
         if: runner.os == 'macOS' && runner.arch == 'X64' && steps.cache-libhegel-macos.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: hegeldev/hegel-rust
           ref: f81c6cceabe3c6695a249588c751a5ce93dffa00
@@ -168,7 +186,7 @@ jobs:
 
       - name: Save built libhegel (macOS x86_64)
         if: runner.os == 'macOS' && runner.arch == 'X64' && steps.cache-libhegel-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: hegel-build
           key: ${{ steps.cache-libhegel-macos.outputs.cache-primary-key }}
@@ -184,6 +202,8 @@ jobs:
 
       - name: Install libhegel
         shell: bash
+        env:
+          JOLT_CHEZ: ${{ steps.chez.outputs.executable }}
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" \
             -A:test -m hegel.install
@@ -198,11 +218,12 @@ jobs:
       - name: Run tests
         shell: bash
         env:
+          JOLT_CHEZ: ${{ steps.chez.outputs.executable }}
           JOLT_HEGEL_REQUIRED: "1"
         run: |
           JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:test
 
-# Windows x86-64 now runs the REAL loopback HTTP runtime, not a portable subset.
+# Windows x86-64 runs the REAL loopback HTTP runtime, not a portable subset.
 # The pinned jolt-tcp W6A revision ships a reviewed Windows readiness backend and
 # public client, so the former "no socket runtime" caveat is obsolete and no
 # runtime or socket group is skipped on this target.
@@ -211,87 +232,81 @@ jobs:
 # disabled by a jolt-hegel resolution or install failure, and then the complete
 # Hegel-required suite. Both run through native PowerShell and invoke Chez
 # directly via the runtime's host\chez\cli.ss; neither routes execution through
-# bash. MSYS2 is present only to source-build Chez itself.
+# bash.
+#
+# MSYS2 is gone with the source build it existed for. Its one remaining
+# non-Chez consumer was the POSIX sh that the source Jolt launcher reads through
+# JOLT_SH while resolving the git dependency graph, so this lane now resolves
+# Git for Windows' sh.exe explicitly and hands it to the runners -- exactly as
+# W11 does -- rather than leaving the script to fall back to a PATH that no
+# longer carries an MSYS2 shell.
   windows-runtime:
     name: HTTP runtime suite (Windows x86_64; real loopback)
     runs-on: windows-2022
     timeout-minutes: 45
-    defaults:
-      run:
-        shell: msys2 {0}
     env:
       JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/aot-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Set up MSYS2 source-build toolchain
-        uses: msys2/setup-msys2@v2
+      - name: Install the verified Chez toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3 # chez-ci-10.4.1.1
         with:
-          msystem: MINGW64
-          update: false
-          path-type: inherit
-          install: >-
-            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-lz4
-            mingw-w64-x86_64-zlib
+          target: windows-x86_64
+          release-tag: ${{ env.CHEZ_RELEASE_TAG }}
+          sha256: 360c60496eea2f8aab0e557eb77e9e18b315bb9181938158ae57655aa541b7f8
+          capabilities: source-runtime
 
-      # See the POSIX lane for why this is restore/save rather than
-      # actions/cache. This job is where it mattered most: its post-job save was
-      # skipped on every failing run, so it rebuilt Chez (6m46s) on each
-      # iteration of a ~90s suite and never once populated the cache.
-      - name: Restore Chez Scheme
-        id: cache-chez-windows
-        uses: actions/cache/restore@v4
-        with:
-          path: chez-install
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-mingw64-v1
-
-      - name: Build official Chez Scheme v10.4.1 from source
-        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
+      - name: Assert official Chez v10.4.1
+        shell: pwsh
+        env:
+          CHEZ_EXE: ${{ steps.chez.outputs.executable }}
+          CHEZ_TARGET: ${{ steps.chez.outputs.target }}
+          CHEZ_ARCHIVE_SHA256: ${{ steps.chez.outputs.archive-sha256 }}
+          CHEZ_CACHE_HIT: ${{ steps.chez.outputs.cache-hit }}
         run: |
-          set -euo pipefail
-          git clone --depth 1 --branch v10.4.1 \
-            https://github.com/cisco/ChezScheme.git "$RUNNER_TEMP/chez-src"
-          cd "$RUNNER_TEMP/chez-src"
-          ./configure --threads
-          make -j"$(nproc)"
-          inst="$GITHUB_WORKSPACE/chez-install"
-          mkdir -p "$inst/bin" "$inst/csv"
-          cp ta6nt/bin/ta6nt/*.exe "$inst/bin/"
-          cp ta6nt/bin/ta6nt/*.dll "$inst/bin/" 2>/dev/null || true
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/bin/"
-          cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot "$inst/csv/"
-          cp ta6nt/boot/ta6nt/scheme.h "$inst/csv/"
-          cp ta6nt/boot/ta6nt/libkernel.a "$inst/csv/"
-
-      - name: Provide and assert official Chez v10.4.1
-        run: |
-          set -euo pipefail
-          bindir="$GITHUB_WORKSPACE/chez-install/bin"
-          test -x "$bindir/scheme.exe"
-          { echo '#!/bin/sh'; echo "exec \"$bindir/scheme.exe\" \"\$@\""; } > "$bindir/chez"
-          { echo '#!/bin/sh'; echo 'exec gcc "$@"'; } > "$bindir/cc"
-          chmod +x "$bindir/chez" "$bindir/cc"
-          echo "$bindir" >> "$GITHUB_PATH"
-          echo "JOLT_CHEZ_CSV=$GITHUB_WORKSPACE/chez-install/csv" >> "$GITHUB_ENV"
-          "$bindir/chez" --version | tee "$RUNNER_TEMP/chez-version"
-          grep -Fq '10.4.1' "$RUNNER_TEMP/chez-version"
-
-      # Saved before any test runs, so a red suite cannot cost the next run a
-      # 6m46s Chez rebuild.
-      - name: Save Chez Scheme
-        if: steps.cache-chez-windows.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: chez-install
-          key: ${{ steps.cache-chez-windows.outputs.cache-primary-key }}
+          Write-Host "target         = $env:CHEZ_TARGET"
+          Write-Host "executable     = $env:CHEZ_EXE"
+          Write-Host "archive sha256 = $env:CHEZ_ARCHIVE_SHA256"
+          Write-Host "cache hit      = $env:CHEZ_CACHE_HIT"
+          if (-not (Test-Path $env:CHEZ_EXE)) {
+            throw "Chez executable not found: $env:CHEZ_EXE"
+          }
+          $version = (& $env:CHEZ_EXE --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "scheme.exe --version exited $LASTEXITCODE" }
+          Write-Host "chez version: $version"
+          if (-not $version.Contains('10.4.1')) {
+            throw "expected Chez Scheme 10.4.1, got: $version"
+          }
 
       - name: Checkout pinned Jolt fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
           submodules: recursive
           path: jolt
+
+      # The gates declare no :extra-deps, but every alias still resolves the git
+      # dependency graph and Jolt derives its git cache key by shelling out, so
+      # the launcher reads JOLT_SH before a namespace is loaded. Resolve the real
+      # sh.exe here and pass what was actually found, rather than relying on the
+      # script's fallback now that no MSYS2 PATH is inherited.
+      - name: Locate the runner's sh.exe
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:ProgramFiles\Git\bin\sh.exe",
+            "${env:ProgramFiles(x86)}\Git\bin\sh.exe",
+            "C:\Program Files\Git\bin\sh.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $sh = if ($candidates) { $candidates[0] } else { (Get-Command sh -ErrorAction SilentlyContinue).Source }
+          if (-not $sh) {
+            throw "no sh.exe found on this runner; JOLT_SH would point at nothing"
+          }
+          Write-Host "sh.exe = $sh"
+          echo "JOLT_HTTP_SH=$sh" >> $env:GITHUB_ENV
 
       # Runs FIRST and declares no :extra-deps. Real Windows HTTP socket
       # coverage must not be able to disappear because jolt-hegel failed to
@@ -300,11 +315,13 @@ jobs:
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+          JOLT_HTTP_CHEZ: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ShellExe "$env:JOLT_HTTP_SH" `
             -ExpectedArch 'x86-64' `
             -TestAlias '-M:windows-runtime-test' `
             -TimeoutSeconds 900
@@ -313,11 +330,13 @@ jobs:
         shell: powershell
         env:
           JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
+          JOLT_HTTP_CHEZ: ${{ steps.chez.outputs.executable }}
         run: |
           & "$env:GITHUB_WORKSPACE\tools\test-windows-source.ps1" `
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
-            -ChezExe "$env:GITHUB_WORKSPACE\chez-install\bin\scheme.exe" `
+            -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ShellExe "$env:JOLT_HTTP_SH" `
             -ExpectedArch 'x86-64' `
             -TestAlias '-M:test' `
             -InstallHegel `
@@ -330,10 +349,18 @@ jobs:
 # jolt-tcp revision reaches a jolt.net carrying reviewed Winsock readiness for
 # aarch64 as well as x86-64, so that premise is gone and the preview with it.
 #
-# Source-runtime evidence only: official native tarm64nt Chez 10.4.1, AOT cache
-# disabled, no packaged joltc and no devboot claim. The exact target check in
+# Source-runtime evidence only: native tarm64nt Chez 10.4.1, AOT cache disabled,
+# no packaged joltc and no devboot claim. The exact target check in
 # windows-runtime-test makes an emulated x86-64 Jolt process fail before the
 # positive poller assertion or any HTTP test can pass.
+#
+# Chez now arrives as the shared digest-pinned tarm64nt toolchain rather than a
+# build.bat source build, which removes the ChezScheme checkout, its cache, and
+# the MSVC build step. It removes NO architecture evidence: the version and
+# (machine-type) witnesses below are now applied to the SHIPPED scheme.exe on
+# this runner, so an x86-64 image published under the ARM64 target name fails
+# here rather than running under emulation. The descriptor is an additional
+# check, never a substitute for executing the binary on real ARM64 hardware.
   windows-arm64-runtime:
     name: HTTP runtime suite (Windows aarch64; real loopback)
     runs-on: windows-11-vs2026-arm
@@ -342,7 +369,7 @@ jobs:
       JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt/native-cache
     steps:
       - name: Checkout jolt-http
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The runner label is the only thing selecting this hardware, and a stale
       # or remapped label would otherwise silently downgrade the whole lane to
@@ -357,34 +384,17 @@ jobs:
             throw "expected an ARM64 runner, got '${{ runner.arch }}'"
           }
 
-      # Only the built output is cached; the checkout below is skipped on a hit,
-      # so nothing is cloned either.
-      - name: Restore native ARM64 Chez Scheme
-        id: cache-chez-arm64
-        uses: actions/cache/restore@v4
+      - name: Install the verified Chez toolchain
+        id: chez
+        uses: casselc/jolt-toolchains/setup-chez@095108ae32659757808064d004855092567d3ad3 # chez-ci-10.4.1.1
         with:
-          path: chez-arm64/tarm64nt
-          key: chez-${{ runner.os }}-${{ runner.arch }}-v10.4.1-tarm64nt-v1
-
-      - name: Checkout official Chez Scheme v10.4.1
-        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: cisco/ChezScheme
-          ref: v10.4.1
-          submodules: recursive
-          persist-credentials: false
-          path: chez-arm64
-
-      - name: Build native ARM64 Chez Scheme from source
-        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
-        shell: cmd
-        run: |
-          cd /d "%GITHUB_WORKSPACE%\chez-arm64"
-          call build.bat tarm64nt /only || exit /b 1
+          target: windows-arm64
+          release-tag: ${{ env.CHEZ_RELEASE_TAG }}
+          sha256: 9bc28462823a1447de6d849e129758a6317cc9deafb8e87414817e7244f149c8
+          capabilities: source-runtime
 
       - name: Checkout pinned Jolt core
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: casselc/jolt
           ref: ${{ env.JOLT_CORE_SHA }}
@@ -394,12 +404,22 @@ jobs:
       # Version alone cannot distinguish a native tarm64nt build from an
       # emulated ta6nt one, so assert (machine-type) too. It is read with
       # --script rather than --eval: --eval does not exit nonzero on a failed
-      # expression here, which would let a bad probe report success.
+      # expression here, which would let a bad probe report success. Both
+      # witnesses run against the executable the shared toolchain shipped, on
+      # this ARM64 runner.
       - name: Assert native ARM64 Chez v10.4.1
         shell: pwsh
+        env:
+          CHEZ_EXE: ${{ steps.chez.outputs.executable }}
+          CHEZ_TARGET: ${{ steps.chez.outputs.target }}
+          CHEZ_ARCHIVE_SHA256: ${{ steps.chez.outputs.archive-sha256 }}
+          CHEZ_CACHE_HIT: ${{ steps.chez.outputs.cache-hit }}
         run: |
-          $scheme = Join-Path $env:GITHUB_WORKSPACE `
-            'chez-arm64\tarm64nt\bin\tarm64nt\scheme.exe'
+          Write-Host "target         = $env:CHEZ_TARGET"
+          Write-Host "executable     = $env:CHEZ_EXE"
+          Write-Host "archive sha256 = $env:CHEZ_ARCHIVE_SHA256"
+          Write-Host "cache hit      = $env:CHEZ_CACHE_HIT"
+          $scheme = $env:CHEZ_EXE
           if (-not (Test-Path $scheme)) {
             throw "native ARM64 Chez executable not found: $scheme"
           }
@@ -423,14 +443,23 @@ jobs:
           }
           echo "JOLT_HTTP_CHEZ=$scheme" >> $env:GITHUB_ENV
 
-      # Saved after the build is asserted good and before any test runs, so a
-      # red gate cannot cost the next run a full rebuild.
-      - name: Save native ARM64 Chez Scheme
-        if: steps.cache-chez-arm64.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: chez-arm64/tarm64nt
-          key: ${{ steps.cache-chez-arm64.outputs.cache-primary-key }}
+      # Same reason as the x86-64 lane: the launcher reads JOLT_SH while
+      # deriving its git cache key, and Git for Windows is not at an identical
+      # path on every image, so resolve it and pass what was actually found.
+      - name: Locate the runner's sh.exe
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:ProgramFiles\Git\bin\sh.exe",
+            "${env:ProgramFiles(x86)}\Git\bin\sh.exe",
+            "C:\Program Files\Git\bin\sh.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $sh = if ($candidates) { $candidates[0] } else { (Get-Command sh -ErrorAction SilentlyContinue).Source }
+          if (-not $sh) {
+            throw "no sh.exe found on this runner; JOLT_SH would point at nothing"
+          }
+          Write-Host "sh.exe = $sh"
+          echo "JOLT_HTTP_SH=$sh" >> $env:GITHUB_ENV
 
       # Runs FIRST and declares no :extra-deps, exactly as on x86-64. Real
       # Windows HTTP socket coverage must not be able to disappear because
@@ -442,6 +471,7 @@ jobs:
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
             -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ShellExe "$env:JOLT_HTTP_SH" `
             -ExpectedArch 'aarch64' `
             -TestAlias '-M:windows-runtime-test' `
             -TimeoutSeconds 900
@@ -453,6 +483,7 @@ jobs:
             -JoltHttpPath "$env:GITHUB_WORKSPACE" `
             -RuntimePath "$env:GITHUB_WORKSPACE\jolt" `
             -ChezExe "$env:JOLT_HTTP_CHEZ" `
+            -ShellExe "$env:JOLT_HTTP_SH" `
             -ExpectedArch 'aarch64' `
             -TestAlias '-M:test' `
             -InstallHegel `
