@@ -38,7 +38,7 @@ permissions:
 env:
   # One reviewed fork revision for every source-mode lane. Keep this centralized
   # so a platform cannot silently validate against a different core.
-  JOLT_CORE_SHA: 46e1f74fc14f29283586900ef4b98c45375c0500
+  JOLT_CORE_SHA: b921991e532ce2555d947bf88bc0464bf0c89d27
   # One immutable toolchain release for all six targets. The per-target archive
   # digests live next to each target below so a wrong pairing cannot pass.
   CHEZ_RELEASE_TAG: chez-ci-10.4.1.1

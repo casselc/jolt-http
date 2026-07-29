@@ -26,20 +26,21 @@ changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
 The reviewed Jolt proposal fork is published only to `casselc/jolt`, now
-rebased over upstream v0.5.7 on `codex/upstream-rebase-v0.5.7`; nothing has
+rebased over upstream v0.5.10 on `codex/upstream-rebase-v0.5.10`; nothing has
 been pushed to the upstream project's origin and no pull request has been
 opened. The current reviewed core baseline is
-`46e1f74fc14f29283586900ef4b98c45375c0500`. Its HTTP prerequisites include
-scoped array ranges at rebased commit `701c5ca5`, Windows path handling, the
-variadic FFI boundary at rebased commit `339534c7`, and transactional Git
-dependency resolution. The per-namespace runtime AOT design remains excluded
-from the active loader because it cannot replay downstream top-level effects.
+`b921991e532ce2555d947bf88bc0464bf0c89d27`. Its HTTP prerequisites include
+scoped array ranges at reminted commit `8bc595eb`, Windows path handling, the
+variadic FFI boundary at reminted commit `ec46ddcb`, and serialized
+transactional Git dependency resolution. The per-namespace runtime AOT design
+remains excluded from the active loader because it cannot replay downstream
+top-level effects.
 
 The current dependency pin is jolt-tcp
-`911cf783d56e988adb2b8f716b6636fae5454e52`, transitively using jolt-net
-`c3747385235df812e0d739a3e9f71c4dfb07b474`. The pin retains the W6A.1 wake
+`e67fd1eb331e6c9736140f2ce4cfeba9ec0d8787`, transitively using jolt-net
+`3b83e53f275f5087f9948b9fef445546fe773eb5`. The pin retains the W6A.1 wake
 cursor repair, adds reviewed Winsock readiness for aarch64 alongside x86-64, and
-aligns every hosted runtime checkout with the same rebased core — which is now
+aligns every runtime checkout with the same rebased core — which is
 held in a single `JOLT_CORE_SHA` workflow variable rather than repeated per job.
 
 ## Implementation update — 2026-07-24
@@ -48,8 +49,8 @@ held in a single `JOLT_CORE_SHA` workflow variable rather than repeated per job.
   `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
   failure injection.
 - `deps.edn` pins jolt-tcp at
-  `911cf783d56e988adb2b8f716b6636fae5454e52`, which transitively pins the
-  validated jolt-net revision `c3747385235df812e0d739a3e9f71c4dfb07b474`. CI
+  `e67fd1eb331e6c9736140f2ce4cfeba9ec0d8787`, which transitively pins the
+  validated jolt-net revision `3b83e53f275f5087f9948b9fef445546fe773eb5`. CI
   resolves this immutable graph directly rather than cloning mutable sibling
   branches. (The 2026-07-24 entry below was written against jolt-tcp
   `0c3e085f`; the W6B repin to the reviewed W6A runtime is what promoted
@@ -322,13 +323,12 @@ and driven by measured needs.
 
 The reviewed fork now implements overlap-safe `System/arraycopy`, bulk native
 array transfers, whole-array borrowing, and scoped nonzero-offset byte-array
-borrowing. Commit `1c8fdb97eee58870b9fb9de928430d016c0cf06d` is the current
-byte-slice implementation. `9dc88108299b8d15d9d31e1b65403bd356da3fbc` is its
-descendant that also rejects executor submissions after shutdown, preserves
-drive-rooted project paths on Windows, and validates immutable Git dependency
-checkouts transactionally; the current HTTP/transport baseline is in turn its
-descendant `46e1f74fc14f29283586900ef4b98c45375c0500`, which every CI and
-runtime checkout pins through the single `JOLT_CORE_SHA` workflow variable.
+borrowing. Reminted commit `8bc595eb` is the current byte-slice
+implementation. The current HTTP/transport baseline,
+`b921991e532ce2555d947bf88bc0464bf0c89d27`, also rejects executor submissions
+after shutdown, preserves drive-rooted project paths on Windows, and validates
+immutable Git dependency checkouts transactionally; every CI and runtime
+checkout pins it through the single `JOLT_CORE_SHA` workflow variable.
 `jolt.net` and jolt-tcp use those borrowed ranges
 for socket I/O, including partial sends whose next position is nonzero.
 Allocation and throughput measurement remains open.
@@ -445,8 +445,8 @@ actual local/peer endpoint maps through `socket-info`; jolt-http derives
 `jolt.net` or `jolt.ffi`.
 
 Windows readiness is no longer follow-up work, on either architecture. The
-pinned jolt-tcp revision (`911cf78`) ships reviewed Winsock readiness backends
-and a public client for x86-64 **and aarch64** over jolt-net `c3747385`, and
+pinned jolt-tcp revision (`e67fd1e`) ships reviewed Winsock readiness backends
+and a public client for x86-64 **and aarch64** over jolt-net `3b83e53`, and
 both of jolt-http's Windows lanes now run the complete real-loopback suite
 rather than a portable subset — the same 55 scenarios they run on Linux, with no
 runtime or socket group skipped. See

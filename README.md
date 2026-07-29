@@ -381,10 +381,10 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
 ```
 
 The current reviewed core baseline is
-`46e1f74fc14f29283586900ef4b98c45375c0500`, held in a single `JOLT_CORE_SHA`
+`b921991e532ce2555d947bf88bc0464bf0c89d27`, held in a single `JOLT_CORE_SHA`
 workflow variable so no platform can validate against a different core.
-`deps.edn` pins jolt-tcp at `911cf783d56e988adb2b8f716b6636fae5454e52`, which
-transitively pins jolt-net at `c3747385235df812e0d739a3e9f71c4dfb07b474`;
+`deps.edn` pins jolt-tcp at `e67fd1eb331e6c9736140f2ce4cfeba9ec0d8787`, which
+transitively pins jolt-net at `3b83e53f275f5087f9948b9fef445546fe773eb5`;
 jolt-net is never declared directly at the HTTP layer.
 
 Progress is also written to the absolute
