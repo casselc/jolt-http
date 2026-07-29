@@ -43,6 +43,25 @@ cursor repair, adds reviewed Winsock readiness for aarch64 alongside x86-64, and
 aligns every runtime checkout with the same rebased core — which is
 held in a single `JOLT_CORE_SHA` workflow variable rather than repeated per job.
 
+## Implementation update — 2026-07-28 (Jolt v0.5.10 checkpoint)
+
+- HTTP revision `1cfb69190618699d7117f9be1ba0264e3588551f` validates the
+  exact core/TCP/net chain named above.
+- Hosted
+  [run 30419454290](https://github.com/casselc/jolt-http/actions/runs/30419454290)
+  passed all six targets. Every lane completed 316 generative checks with zero
+  failures, including 24 pure tests / 32 assertions and 19 protocol tests /
+  25 assertions. Windows x86-64 and aarch64 additionally passed the
+  dependency-free real-loopback gate with 8 tests / 68 assertions and no
+  failures or errors.
+- `src/` and `test/` are byte-identical to the preceding checkpoint. Local
+  revalidation reproduced all nine SMT verdicts (three UNSAT corrected models
+  and six SAT controls) and the Prolog EOF controls: no corrected violation,
+  12 buggy witnesses, and non-vacuous idle/error/claimed-response paths.
+
+This is a dependency-integration checkpoint. HTTP framing, EOF, and response
+ownership semantics did not change, so no new proof model is warranted.
+
 ## Implementation update — 2026-07-24
 
 - Production namespaces depend only on jolt-tcp. They import neither
