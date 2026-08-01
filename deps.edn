@@ -4,10 +4,14 @@
 ;;
 ;; jolt-tcp declares the libc :jolt/native spec it needs, and jolt collects
 ;; :jolt/native declarations from every dep in the tree, so it must NOT be
-;; redeclared here.
+;; redeclared here. Pin the reviewed wake-cursor integration commit so a git
+;; checkout of jolt-http is self-contained rather than requiring a sibling
+;; workspace checkout.
 {:paths ["src"]
 
- :deps {jolt-lang/jolt-tcp {:local/root "../jolt-tcp"}}
+ :deps {io.github.casselc/jolt-tcp
+        {:git/url "https://github.com/casselc/jolt-tcp.git"
+         :git/sha "0a3883475c77458f4f204cef0313d3b3d578bfd6"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the peeled commit behind
