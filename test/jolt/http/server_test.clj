@@ -16,6 +16,7 @@
             [jolt.http.protocol :as protocol]
             [jolt.http.server :as http]
             [teensyp.ffi-net :as net]
+            [teensyp.server :as tcp]
             ;; Loaded for their side effects on the run: the deftests below are
             ;; discovered by clojure.test/run-tests, the loopback properties by
             ;; run-properties!.
@@ -41,6 +42,17 @@
     (println "ok  " label)
     (do (swap! failures inc)
         (println "FAIL" label "\n   got:" (pr-str actual)))))
+
+(defn- shutdown-and-await-test! [executor]
+  (.shutdown executor)
+  (loop []
+    (when-not (.isTerminated executor)
+      (Thread/yield)
+      (recur))))
+
+(defprotocol ExecutorLifecycleProbe
+  (shutdown [this])
+  (isTerminated [this]))
 
 (defn- utf8 ^bytes [s] (.getBytes ^String s "UTF-8"))
 (defn- ->str [^bytes b] (when b (String. b "UTF-8")))
@@ -151,6 +163,193 @@
         (check "basic content-length" "11" (header-of resp "Content-Length"))
         (check "basic server header" "jolt-http" (header-of resp "Server"))
         (check-pred "date header present" some? (header-of resp "Date"))))))
+
+(defn- test-executor-ownership []
+  ;; HTTP must transfer ownership of its default pool to jolt-tcp. Otherwise
+  ;; stop-server closes the sockets but leaks every default handler thread.
+  (let [srv (http/run-server hello-handler
+                             :port (next-port)
+                             :reuse-address? true)
+        executor (get-in srv [:srv :executor])]
+    (check "default executor starts running" false (.isShutdown executor))
+    (http/stop-server srv)
+    (check "default executor shuts down on stop" true (.isShutdown executor))
+    (check "default executor terminates before stop returns"
+           true (.isTerminated executor)))
+
+  ;; A supplied pool remains borrowed by default. Shut it down here only after
+  ;; observing the post-stop state so the test itself does not leak it.
+  (let [executor (java.util.concurrent.Executors/newFixedThreadPool 1)
+        srv (http/run-server hello-handler
+                             :port (next-port)
+                             :reuse-address? true
+                             :executor executor)]
+    (try
+      (http/stop-server srv)
+      (check "caller executor remains running on stop"
+             false (.isShutdown executor))
+      (finally
+        (shutdown-and-await-test! executor))))
+
+  ;; Preserve jolt-tcp's existing explicit adoption option for callers that do
+  ;; want the server lifecycle to own their pool.
+  (let [executor (java.util.concurrent.Executors/newFixedThreadPool 1)
+        srv (http/run-server hello-handler
+                             :port (next-port)
+                             :reuse-address? true
+                             :executor executor
+                             :shutdown-executor? true)]
+    (http/stop-server srv)
+    (check "adopted caller executor shuts down on stop"
+           true (.isShutdown executor))
+    (check "adopted caller executor terminates before stop returns"
+           true (.isTerminated executor)))
+
+  ;; `false` already selects the default via `or`; classify it as internally
+  ;; owned as well so that fallback pool cannot leak.
+  (let [srv (http/run-server hello-handler
+                             :port (next-port)
+                             :reuse-address? true
+                             :executor false)
+        executor (get-in srv [:srv :executor])]
+    (http/stop-server srv)
+    (check "false executor fallback is owned and terminated"
+           true (.isTerminated executor))))
+
+(defn- test-executor-startup-failure []
+  (let [passed (atom nil)
+        error (try
+                (with-redefs
+                  [tcp/run-server
+                   (fn [options]
+                     (reset! passed options)
+                     (throw (ex-info "injected TCP startup failure"
+                                     {:err ::startup-failure})))]
+                  (http/run-server hello-handler :port (next-port)))
+                nil
+                (catch :default e e))
+        executor (:executor @passed)]
+    (check "injected startup failure propagates"
+           ::startup-failure (:err (ex-data error)))
+    (check-pred "startup failure received internal executor" some? executor)
+    (check "internal executor shuts down on startup failure"
+           true (.isShutdown executor))
+    (check "internal executor terminates before startup failure returns"
+           true (.isTerminated executor)))
+
+  (let [executor (java.util.concurrent.Executors/newFixedThreadPool 1)
+        passed (atom nil)
+        error (try
+                (with-redefs
+                  [tcp/run-server
+                   (fn [options]
+                     (reset! passed options)
+                     (throw (ex-info "injected TCP startup failure"
+                                     {:err ::startup-failure})))]
+                  (http/run-server hello-handler
+                                   :port (next-port)
+                                   :executor executor))
+                nil
+                (catch :default e e))]
+    (try
+      (check "caller executor reaches TCP unchanged"
+             true (identical? executor (:executor @passed)))
+      (check "caller executor remains running on startup failure"
+             false (.isShutdown executor))
+      (check "caller startup failure propagates"
+             ::startup-failure (:err (ex-data error)))
+      (finally
+        (shutdown-and-await-test! executor))))
+
+  (let [executor (java.util.concurrent.Executors/newFixedThreadPool 1)
+        error (try
+                (with-redefs
+                  [tcp/run-server
+                   (fn [_options]
+                     (throw (ex-info "injected TCP startup failure"
+                                     {:err ::startup-failure})))]
+                  (http/run-server hello-handler
+                                   :port (next-port)
+                                   :executor executor
+                                   :shutdown-executor? true))
+                nil
+                (catch :default e e))]
+    (check "adopted caller startup failure propagates"
+           ::startup-failure (:err (ex-data error)))
+    (check "adopted caller executor shuts down on startup failure"
+           true (.isShutdown executor))
+    (check "adopted caller executor terminates before startup failure returns"
+           true (.isTerminated executor))))
+
+(defn- test-executor-cleanup-failure []
+  (let [passed (atom nil)
+        cleanup-called? (atom false)
+        startup-error (ex-info "injected TCP startup failure"
+                               {:err ::startup-failure})
+        error (try
+                (with-redefs
+                  [tcp/run-server
+                   (fn [options]
+                     (reset! passed options)
+                     (throw startup-error))
+                   jolt.http.server/shutdown-and-await!
+                   (fn [_executor]
+                     (reset! cleanup-called? true)
+                     (throw (ex-info "injected executor cleanup failure"
+                                     {:err ::cleanup-failure})))]
+                  (http/run-server hello-handler :port (next-port)))
+                nil
+                (catch :default e e))
+        executor (:executor @passed)]
+    (try
+      (check "executor cleanup was attempted" true @cleanup-called?)
+      (check "cleanup failure preserves original startup exception"
+             true (identical? startup-error error))
+      (finally
+        (shutdown-and-await-test! executor)))))
+
+(defn- test-executor-cleanup-awaits-termination []
+  ;; A custom lifecycle probe makes the wait contract deterministic. The first
+  ;; termination poll returns false; the second publishes that it was reached
+  ;; and then blocks until this test releases it. A shutdown-only or one-poll
+  ;; implementation therefore cannot pass due to thread scheduling luck (the
+  ;; outer scenario watchdog bounds either mutant).
+  (let [shutdown-called (java.util.concurrent.CountDownLatch. 1)
+        second-poll (java.util.concurrent.CountDownLatch. 1)
+        release-poll (java.util.concurrent.CountDownLatch. 1)
+        polls (atom 0)
+        executor (reify ExecutorLifecycleProbe
+                   (shutdown [_]
+                     (.countDown shutdown-called))
+                   (isTerminated [_]
+                     (if (= 1 (swap! polls inc))
+                       false
+                       (do
+                         (.countDown second-poll)
+                         (.await release-poll)
+                         true))))
+        startup-error (ex-info "injected TCP startup failure"
+                               {:err ::startup-failure})]
+    (with-redefs
+      [tcp/run-server (fn [_options] (throw startup-error))]
+      (let [result (future
+                     (try
+                       (http/run-server hello-handler
+                                        :port (next-port)
+                                        :executor executor
+                                        :shutdown-executor? true)
+                       nil
+                       (catch :default e e)))]
+        (.await shutdown-called)
+        (.await second-poll)
+        (check "startup cleanup keeps waiting after a false termination poll"
+               false (realized? result))
+        (.countDown release-poll)
+        (let [error @result]
+          (check "startup cleanup polls until termination"
+                 2 @polls)
+          (check "awaiting cleanup preserves the original startup exception"
+                 true (identical? startup-error error)))))))
 
 (defn- test-request-map []
   (with-server request-info-handler
@@ -918,6 +1117,10 @@
 (def ^:private scenarios
   [["date formatting"      test-date-formatting]
    ["charset parsing"      test-charset-parsing]
+   ["executor ownership"   test-executor-ownership]
+   ["executor startup failure" test-executor-startup-failure]
+   ["executor cleanup failure" test-executor-cleanup-failure]
+   ["executor cleanup awaits termination" test-executor-cleanup-awaits-termination]
    ["basic response"       test-basic]
    ["request map"          test-request-map]
    ["request methods"      test-methods]

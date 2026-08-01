@@ -108,6 +108,7 @@ by an explicit `instance?` test internally.
 | `:response-buffer-size` | The size of the buffer used for the response         | 32K         |
 | `:reuse-address?`       | The SO_REUSEADDR socket option                       | false       |
 | `:server-name`          | Reported as `:server-name` on requests               | 127.0.0.1   |
+| `:shutdown-executor?`   | Adopt and stop a caller-supplied handler executor    | false       |
 | `:stream-queue-size`    | Request body chunks buffered before backpressure     | 8           |
 | `:write-buffer-size`    | The write buffer size in bytes                       | 128K        |
 | `:write-queue-size`     | The maximum number of writes that can be queued      | 64          |
