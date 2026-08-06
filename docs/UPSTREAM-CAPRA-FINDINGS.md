@@ -22,13 +22,29 @@ Two of those reach Capra directly and are cross-referenced below.
 | Compared against | `jolt-http` @ `3046a24`, this branch |
 | Method | Source review of all 497 lines of `src/capra/http.clj` plus `server.clj`, driven by the rule set jolt-http's conformance suite encodes |
 
-**Everything below is derived from reading upstream source, not from executing
-it.** jolt-http is a reimplementation, so a failing case there is evidence that
-a *class* of bug exists in the shared parser design, not that the JVM code
-fails identically. Each finding carries the source lines it is read from, and
-the ones predicting a concrete failure carry a request to send; those should be
-run against the JVM before being filed. Line references are `file:line` against
-the SHA above.
+**Six findings have been reproduced against a live JVM Capra server** — see
+the *Confirmed* column below. The rest are derived from reading upstream
+source; for those, jolt-http is a reimplementation, so a failing case there is
+evidence that a *class* of bug exists in the shared parser design, not that the
+JVM code fails identically. Each carries the source lines it is read from and a
+request to send, and should be run before filing. Line references are
+`file:line` against the SHA above.
+
+The confirmed set was checked by building upstream at the SHAs above (JDK 21,
+Clojure 1.12.5, real `ring-core-protocols` 1.15.5), running Capra on loopback
+with a handler echoing `:uri`, and driving raw sockets at it:
+
+| Finding | Payload | Observed |
+| --- | --- | --- |
+| 1 | `Content-Length: 6` + `Transfer-Encoding: chunked`, then a second request | two 200s; **the smuggled `GET /admin` reached the handler** |
+| 2 | `Content-Length: -5`, then a second request | two 200s; **the smuggled `GET /admin` reached the handler** |
+| 3 | `0\r\nX: y\r\n\r\n` terminator | 200 then 400 — the trailer was parsed as a request line |
+| 6 | leading bare `\n` | connection dropped, zero bytes returned; `IndexOutOfBoundsException` at `teensyp/buffer.clj:68` |
+| 13 | two `Host` fields | 200, not the required 400 |
+| 14 | `5;n=v` chunk extension | connection dropped; `NumberFormatException` at `http.clj:415` |
+
+Finding 17's stdout claim is incidentally confirmed too: those stack traces
+arrived on stdout, not stderr.
 
 Capra's README calls the adapter experimental and not recommended for
 production, and this list should be read in that light — it is a conformance
@@ -42,25 +58,25 @@ same classes those projects found in widely deployed servers.
 
 ## Summary
 
-| # | Severity | Class | Finding |
-| --- | --- | --- | --- |
-| [1](#1) | High | smuggling | `Content-Length` **and** `Transfer-Encoding` are both accepted, and Content-Length wins |
-| [2](#2) | High | smuggling | A negative `Content-Length` is accepted; the body is then parsed as a pipelined request |
-| [3](#3) | High | smuggling | The chunked trailer section is not consumed and is parsed as the next request |
-| [4](#4) | High | injection | Response header names and values are written unvalidated (response splitting, CWE-113) |
-| [5](#5) | High | availability | More than 32 synchronous pipelined requests overflow the control queue and kill the connection |
-| [6](#6) | Medium-High | availability | A leading bare LF crashes the connection (inherited from `teensyp.buffer/read-line`) |
-| [7](#7) | Medium-High | framing | `HEAD` responses carry a body; `204`/`304` are not special-cased |
-| [8](#8) | Medium-High | DoS | No aggregate header-count or header-byte limit |
-| [9](#9) | Medium-High | correctness | A truncated request body is indistinguishable from a complete one |
-| [10](#10) | Medium-High | liveness | An async handler's response sink is never closed, so the connection hangs |
-| [11](#11) | Medium | corruption | The `ThreadLocal` response buffer is unsafe on any non-thread-per-task executor |
-| [12](#12) | Medium | smuggling | `Foo : bar` and obs-fold lines are accepted as distinct headers |
-| [13](#13) | Medium | conformance | Multiple `Host` headers are accepted |
-| [14](#14) | Medium | conformance | Chunk extensions are rejected; chunk sizes accept `+`/`-` |
-| [15](#15) | Low-Medium | conformance | Malformed or duplicate `Content-Length` closes abruptly instead of answering 400 |
-| [16](#16) | Low-Medium | conformance | `Expect: 100-continue` is not implemented |
-| [17](#17) | Low | misc | Error logger prints to stdout; >2 GiB responses throw; a stray `Connection` header |
+| # | Severity | Confirmed | Class | Finding |
+| --- | --- | --- | --- | --- |
+| [1](#1) | High | **executed** | smuggling | `Content-Length` **and** `Transfer-Encoding` are both accepted, and Content-Length wins |
+| [2](#2) | High | **executed** | smuggling | A negative `Content-Length` is accepted; the body is then parsed as a pipelined request |
+| [3](#3) | High | **executed** | smuggling | The chunked trailer section is not consumed and is parsed as the next request |
+| [4](#4) | High | reasoned | injection | Response header names and values are written unvalidated (response splitting, CWE-113) |
+| [5](#5) | High | reasoned | availability | More than 32 synchronous pipelined requests overflow the control queue and kill the connection |
+| [6](#6) | Medium-High | **executed** | availability | A leading bare LF crashes the connection (inherited from `teensyp.buffer/read-line`) |
+| [7](#7) | Medium-High | reasoned | framing | `HEAD` responses carry a body; `204`/`304` are not special-cased |
+| [8](#8) | Medium-High | reasoned | DoS | No aggregate header-count or header-byte limit |
+| [9](#9) | Medium-High | reasoned | correctness | A truncated request body is indistinguishable from a complete one |
+| [10](#10) | Medium-High | reasoned | liveness | An async handler's response sink is never closed, so the connection hangs |
+| [11](#11) | Medium | reasoned | corruption | The `ThreadLocal` response buffer is unsafe on any non-thread-per-task executor |
+| [12](#12) | Medium | reasoned | smuggling | `Foo : bar` and obs-fold lines are accepted as distinct headers |
+| [13](#13) | Medium | **executed** | conformance | Multiple `Host` headers are accepted |
+| [14](#14) | Medium | **executed** | conformance | Chunk extensions are rejected; chunk sizes accept `+`/`-` |
+| [15](#15) | Low-Medium | reasoned | conformance | Malformed or duplicate `Content-Length` closes abruptly instead of answering 400 |
+| [16](#16) | Low-Medium | reasoned | conformance | `Expect: 100-continue` is not implemented |
+| [17](#17) | Low | partial | misc | Error logger prints to stdout; >2 GiB responses throw; a stray `Connection` header |
 
 ---
 
