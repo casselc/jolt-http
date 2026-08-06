@@ -1,0 +1,147 @@
+From 2f5d1fc5896630e660621b660a4a211b275b783f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:26:59 +0000
+Subject: [capra PATCH 09/11] Validate the response before writing any of it
+
+write-header put the field name and value into the buffer unchecked, so a
+handler that built a header from client-controlled input -- the canonical
+case being a Location taken from a query parameter -- let a client inject
+CRLF and forge the rest of the response, including a whole second
+response on a keep-alive connection (CWE-113). write-status-line was
+equally trusting: it interpolated `(str status)` directly, and
+reason/status->reason is a plain map, so an unknown code returned nil and
+write-ascii threw a NullPointerException on it.
+
+Check the status is a three-digit integer and every field name a token
+with a value free of CR, LF and NUL, and replace the whole response with
+a 500 when it is not. The check runs before the first byte is written,
+because after that nothing can be retracted. Give status->reason a
+default so a legal but unlisted status code no longer throws.
+---
+ src/capra/http.clj         | 46 +++++++++++++++++++++++++++++++++-----
+ test/capra/server_test.clj | 38 +++++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 5 deletions(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 4604ef8..1a99e7b 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -333,7 +333,7 @@
+   [^ByteBuffer buffer {:keys [status]}]
+   (doto buffer
+     (.put ^bytes http-1-1) (write-ascii (str status))
+-    (.put (byte SPACE))    (write-ascii (reason/status->reason status))
++    (.put (byte SPACE))    (write-ascii (reason/status->reason status "Unknown"))
+     (write-crlf)))
+ 
+ (defn- write-header [^ByteBuffer buffer k v]
+@@ -375,17 +375,53 @@
+ (defn- normalize-headers [headers]
+   (persistent! (reduce-kv assoc-response-header! (transient {}) headers)))
+ 
++(def ^:private re-field-value #"[^\r\n\u0000]*")
++
++(defn- valid-header-value? [value]
++  (and (string? value) (re-matches re-field-value value)))
++
++(defn- valid-header? [[name value]]
++  (and (string? name)
++       (re-matches re-token name)
++       (if (vector? value)
++         (every? valid-header-value? value)
++         (valid-header-value? value))))
++
++(defn- valid-response?
++  "Return true if the response can be written without corrupting the message.
++  RFC 9112 section 4 defines the status code as three digits, and the field
++  syntax of RFC 9110 section 5.5 admits neither a name that is not a token nor
++  a value containing CR, LF or NUL."
++  [{:keys [status headers]}]
++  (and (integer? status)
++       (<= 100 status 999)
++       (every? valid-header? headers)))
++
++(def ^:private invalid-response
++  {:status  500
++   :headers {"Content-Type" "text/plain; charset=UTF-8"}
++   :body    "Internal Server Error"})
++
+ (def ^:private re-close-connection #"(?i)(^| *,)close( *,|$)")
+ 
+ (defn- connection-close? [{:strs [connection]}]
+   (when connection (.find (re-matcher re-close-connection connection))))
+ 
+ (defn- ring-responder
+-  [request socket handled done {buf-size :response-buffer-size}]
+-  (fn respond [{:keys [headers body] :as response} async?]
++  [request socket handled done {buf-size :response-buffer-size
++                                :keys    [error-logger]}]
++  ;; The response is checked before the first byte of it is written, because
++  ;; once bytes are on the wire nothing can be retracted.
++  (fn respond [response async?]
+     (when (compare-and-set! handled false true)
+-      (let [buffer  (get-cached response-buffer #(ByteBuffer/allocate buf-size))
+-            headers (normalize-headers headers)
++      (let [response (if (valid-response? response)
++                       response
++                       (do (error-logger (ex-info "Invalid response"
++                                                  {:response response}))
++                           invalid-response))
++            body    (:body response)
++            buffer  (get-cached response-buffer #(ByteBuffer/allocate buf-size))
++            headers (normalize-headers (:headers response))
+             close?  (connection-close? (:headers request))]
+         (.clear ^ByteBuffer buffer)
+         (write-response-head buffer response headers close?)
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index 8d4836d..d725feb 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -682,6 +682,44 @@
+         (is (str/starts-with? response "HTTP/1.1 400 Bad Request\r\n")
+             (str "The header line " (pr-str line) " is rejected"))))))
+ 
++(deftest invalid-response-test
++  (let [logs (atom [])]
++    (with-open [_ (capra/run-server
++                   (fn handler [{:keys [uri]}]
++                     (case uri
++                       "/split"   {:status  200
++                                   :headers {"Location" "/x\r\nX-Injected: yes"}
++                                   :body    "Hello World"}
++                       "/name"    {:status  200
++                                   :headers {"X Example" "foo"}
++                                   :body    "Hello World"}
++                       "/status"  {:status "200" :headers {} :body "Hello World"}
++                       "/unknown" {:status 599 :headers {} :body "Hello World"}))
++                   {:port 4358
++                    :error-logger #(swap! logs conj (ex-message %))})]
++      (doseq [uri ["/split" "/name" "/status"]]
++        (let [response (raw-http-request
++                        "localhost" 4358
++                        (str "GET " uri " HTTP/1.1\r\n"
++                             "Host: localhost\r\n"
++                             "Connection: close\r\n\r\n"))]
++          (is (= (str "HTTP/1.1 500 Internal Server Error\r\n"
++                      "Connection: close\r\n"
++                      "Server: Capra\r\n"
++                      "Content-Type: text/plain; charset=UTF-8\r\n"
++                      "Content-Length: 21\r\n\r\n"
++                      "Internal Server Error")
++                 (str/replace response #"Date: (.*?)\r\n" ""))
++              (str "The response to " uri " is replaced by a 500"))))
++      (is (= ["Invalid response" "Invalid response" "Invalid response"] @logs))
++      (let [response (raw-http-request
++                      "localhost" 4358
++                      (str "GET /unknown HTTP/1.1\r\n"
++                           "Host: localhost\r\n"
++                           "Connection: close\r\n\r\n"))]
++        (is (str/starts-with? response "HTTP/1.1 599 Unknown\r\n")
++            "A status with no known reason phrase is still written")))))
++
+ (deftest file-response-body-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

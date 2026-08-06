@@ -1,0 +1,103 @@
+From 49afe43adebb868ef2c0abdcb4308835625c9000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:16:05 +0000
+Subject: [capra PATCH 01/11] Reject requests with both Content-Length and
+ Transfer-Encoding
+
+A request carrying both fields was accepted, and read-body-stream frames
+the body by Content-Length in preference to the chunked encoding. That is
+the CL.TE request smuggling primitive: a front end that honours
+Transfer-Encoding forwards one request where Capra sees one request plus
+the start of another, which is then answered as a pipelined request.
+
+RFC 9112 section 6.3 requires such a message to be rejected. Reject it
+with a 400 before the handler is dispatched. The check is placed after
+the transfer encoding check so that an unsupported encoding still gets
+the more specific 501.
+---
+ src/capra/http.clj         |  6 ++++++
+ src/capra/http/error.clj   |  5 +++++
+ test/capra/server_test.clj | 27 +++++++++++++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index a999c98..c0c8f98 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -361,6 +361,10 @@
+ (defn- valid-transfer-encoding? [{{encoding "transfer-encoding"} :headers}]
+   (or (nil? encoding) (.equalsIgnoreCase "chunked" encoding)))
+ 
++(defn- conflicting-framing? [{:keys [headers]}]
++  (and (contains? headers "content-length")
++       (contains? headers "transfer-encoding")))
++
+ (defn- ring->stream-handler [ring-handler request done opts]
+   (stream/input-stream-handler
+    (fn [in socket]
+@@ -401,6 +405,8 @@
+   (cond
+     (not (valid-transfer-encoding? request))
+     {::step :error, ::error :unsupported-transfer-encoding, ::request request}
++    (conflicting-framing? request)
++    {::step :error, ::error :conflicting-request-framing, ::request request}
+     (not (contains? (:headers request) "host"))
+     {::step :error, ::error :missing-host-header, ::request request}
+     (empty-request-body? request)
+diff --git a/src/capra/http/error.clj b/src/capra/http/error.clj
+index 5760ba2..a2f0568 100644
+--- a/src/capra/http/error.clj
++++ b/src/capra/http/error.clj
+@@ -18,6 +18,11 @@
+    (constantly (plaintext-response 414 "URI too long."))
+    :request-header-field-too-large
+    (constantly (plaintext-response 431 "Request header field too large."))
++   :conflicting-request-framing
++   (constantly
++    (plaintext-response
++     400 (str "Both \"Content-Length\" and \"Transfer-Encoding\" headers in"
++              " request.")))
+    :missing-host-header
+    (constantly (plaintext-response 400 "Missing \"Host\" header in request."))
+    :http-version-not-supported
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index f63a43f..e9195ed 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -393,6 +393,33 @@
+                  (select-keys [:status :headers :body])
+                  (update :headers dissoc "Date")))))))
+ 
++(deftest conflicting-request-framing-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [uri]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (str "Handled " uri)})
++                 {:port 4351})]
++    (let [response (raw-http-request
++                    "localhost" 4351
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Content-Length: 6\r\n"
++                         "Transfer-Encoding: chunked\r\n\r\n"
++                         "0\r\n\r\n"
++                         "GET /admin HTTP/1.1\r\n"
++                         "Host: localhost\r\n\r\n"))]
++      (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                  "Server: Capra\r\n"
++                  "Connection: close\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 65\r\n\r\n"
++                  "Both \"Content-Length\" and \"Transfer-Encoding\" headers"
++                  " in request.")
++             (str/replace response #"Date: (.*?)\r\n" "")))
++      (is (not (str/includes? response "/admin"))
++          "The smuggled request does not reach the handler"))))
++
+ (deftest missing-host-header-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

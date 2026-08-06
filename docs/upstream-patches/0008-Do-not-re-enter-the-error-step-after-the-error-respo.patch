@@ -1,0 +1,35 @@
+From 01944c616eff7914a7872b76d20cdaeb2cdd7902 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:25:30 +0000
+Subject: [capra PATCH 08/11] Do not re-enter the error step after the error
+ response is written
+
+write-error-response returned nil, so tcp-handler's loop returned the
+unchanged error state and stored it. Any further read on the connection
+before the close took effect re-entered the same step: the response
+itself is written only once, because the handled flag has already been
+set, but tcp/close was queued again each time, and once the control queue
+filled the resulting exception was logged for every rejected request that
+had bytes left in the read buffer.
+
+Return an inert step instead, which the loop's case does not match.
+---
+ src/capra/http.clj | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 644c3c6..4604ef8 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -552,7 +552,7 @@
+     (respond (errorf request) false)
+     (when (::handler state) (close-response state nil))
+     (tcp/close socket)
+-    nil))
++    {::step :closed}))
+ 
+ (defn tcp-handler
+   "Create a TeensyP handler from a Ring handler."
+-- 
+2.43.0
+

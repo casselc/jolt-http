@@ -1,0 +1,83 @@
+From fd0f9474d4b19bc55ec93a0989db2f1a77db1bcb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:21:46 +0000
+Subject: [capra PATCH 06/11] Reject requests with more than one Host header
+
+run-ring-handler checked only that a "host" key was present, and repeated
+fields are joined with commas by assoc-request-header!, so `Host: a` plus
+`Host: b` became "a,b" and satisfied the check. RFC 9112 section 3.2
+requires a 400 for a request with more than one Host field, because a
+front end and an origin that pick different values disagree about where
+the request is routed.
+
+Reject the second occurrence as it is parsed.
+---
+ src/capra/http.clj         |  4 +++-
+ src/capra/http/error.clj   |  2 ++
+ test/capra/server_test.clj | 22 ++++++++++++++++++++++
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 905d91b..63ca240 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -90,7 +90,9 @@
+   (if-pos [colon-index (.indexOf line COLON)]
+     (let [name  (str/lower-case (subs line 0 colon-index))
+           value (str/trim (subs line (inc colon-index)))]
+-      (assoc! state :headers (assoc-request-header! headers name value)))
++      (if (and (= name "host") (headers name))
++        {::step :error, ::error :duplicate-host-header}
++        (assoc! state :headers (assoc-request-header! headers name value))))
+     {::step    :error
+      ::error   :invalid-request-header
+      ::request {:bad-header line}}))
+diff --git a/src/capra/http/error.clj b/src/capra/http/error.clj
+index 1991d18..17805da 100644
+--- a/src/capra/http/error.clj
++++ b/src/capra/http/error.clj
+@@ -33,6 +33,8 @@
+     (plaintext-response 400 "Invalid chunk size in request body."))
+    :missing-host-header
+    (constantly (plaintext-response 400 "Missing \"Host\" header in request."))
++   :duplicate-host-header
++   (constantly (plaintext-response 400 "Multiple \"Host\" headers in request."))
+    :http-version-not-supported
+    (fn [{:keys [bad-protocol]}]
+      (plaintext-response
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index eefea19..ac54832 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -567,6 +567,28 @@
+                   "Missing \"Host\" header in request.")
+              (str/replace response #"Date: (.*?)\r\n" ""))))))
+ 
++(deftest duplicate-host-header-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [uri]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (str "Handled " uri)})
++                 {:port 4356})]
++    (let [response (raw-http-request
++                    "localhost" 4356
++                    (str "GET / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Host: example.com\r\n\r\n"))]
++      (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                  "Server: Capra\r\n"
++                  "Connection: close\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 35\r\n\r\n"
++                  "Multiple \"Host\" headers in request.")
++             (str/replace response #"Date: (.*?)\r\n" "")))
++      (is (not (str/includes? response "Handled"))
++          "The request does not reach the handler"))))
++
+ (deftest unsupported-http-version-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

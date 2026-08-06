@@ -1,0 +1,192 @@
+From 8642a867ada3d179b531242f449dd005e1a21b7b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:20:03 +0000
+Subject: [capra PATCH 04/11] Consume the trailer section of a chunked request
+ body
+
+read-chunk! treated the last chunk as `0\r\n` followed by exactly two
+more bytes, which is only correct when the terminator is a bare
+`0\r\n\r\n`. RFC 9112 section 7.1.2 allows a trailer section in between,
+so `0\r\nX-Trailer: v\r\n\r\n` left `Trailer: v\r\n\r\n` in the read
+buffer, which buffer-reads then handed to the start-line parser as the
+next request.
+
+Consume only the chunk-size line of the last chunk and add a :trailers
+step that reads field lines until an empty one, discarding them. Its line
+length is bounded the same way the header section's is.
+
+The bounds check on a data chunk was also measured from the start of the
+chunk-size line rather than the start of the chunk data, so a chunk that
+had arrived all but its final CRLF could set the buffer position past its
+limit; measure it from the data instead.
+
+The handled flag is hoisted out of ring->stream-handler and kept in the
+body state, so that an error raised once the handler is running answers
+at most one response, and the request body stream is closed after that
+response is written rather than left with a reader blocked on it.
+---
+ src/capra/http.clj         | 58 +++++++++++++++++++++++++++-----------
+ test/capra/server_test.clj | 26 +++++++++++++++++
+ 2 files changed, 67 insertions(+), 17 deletions(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index a31a17e..241e8b3 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -391,11 +391,10 @@
+   (and (contains? headers "content-length")
+        (contains? headers "transfer-encoding")))
+ 
+-(defn- ring->stream-handler [ring-handler request done opts]
++(defn- ring->stream-handler [ring-handler request handled done opts]
+   (stream/input-stream-handler
+    (fn [in socket]
+-     (let [handled (atom false)
+-           request (assoc request :body in)
++     (let [request (assoc request :body in)
+            respond (ring-responder request socket handled done opts)
+            raise   (ring-raiser request respond opts)]
+        (ring-handler request respond raise)))
+@@ -403,11 +402,13 @@
+ 
+ (defn- run-streaming-handler [ring-handler request socket opts]
+   (let [done    (volatile! false)
++        handled (atom false)
+         req     (persistent! request)
+-        handler (ring->stream-handler ring-handler req done opts)]
++        handler (ring->stream-handler ring-handler req handled done opts)]
+     (transient
+      {::step     :body
+       ::handler  handler
++      ::handled  handled
+       ::state    (handler socket)
+       ::done     done
+       ::chunked? (chunked-transfer? (:headers req))
+@@ -442,14 +443,22 @@
+     :else
+     (run-streaming-handler ring-handler request socket opts)))
+ 
+-(defn- read-chunk! ^ByteBuffer [^ByteBuffer buffer]
++(defn- read-chunk!
++  "Read the next chunk of a chunked request body, advancing the buffer past it.
++  Returns a buffer limited to the chunk data, `::last-chunk` if the chunk size
++  was zero, or nil if the buffer does not yet hold the whole chunk. Only the
++  chunk-size line of the last chunk is consumed; what follows it is the trailer
++  section."
++  [^ByteBuffer buffer]
+   (let [chunked-buffer (.duplicate buffer)]
+     (when-some [head (buf/read-line chunked-buffer StandardCharsets/US_ASCII)]
+       (let [start  (.position chunked-buffer)
+             length (Long/parseLong head 16)]
+-        (when (<= (+ length 2) (.remaining buffer))
+-          (.position buffer (+ start length 2))
+-          (doto chunked-buffer (.limit (+ start length))))))))
++        (if (zero? length)
++          (do (.position buffer start) ::last-chunk)
++          (when (<= (+ start length 2) (.limit buffer))
++            (.position buffer (+ start length 2))
++            (doto chunked-buffer (.limit (+ start length)))))))))
+ 
+ (defn- next-request [{::keys [done handler state]}]
+   (handler state nil)
+@@ -457,10 +466,22 @@
+ 
+ (defn- read-chunked-body-stream
+   [{::keys [handler state] :as st} socket buffer]
+-  (when-some [chunk-buf (read-chunk! buffer)]
+-    (if (.hasRemaining chunk-buf)
+-      (do (handler state socket chunk-buf) st)
+-      (next-request st))))
++  (when-some [chunk (read-chunk! buffer)]
++    (if (= ::last-chunk chunk)
++      (assoc! st ::step :trailers)
++      (do (handler state socket chunk) st))))
++
++;; The trailer section is read and discarded. It is not exposed to the handler,
++;; which has already been given the request map, but it must be consumed or the
++;; next read would parse it as the start line of a pipelined request.
++
++(defn- read-trailer [state ^ByteBuffer buffer ^long max-buffer-size]
++  (if-some [line (buf/read-line buffer StandardCharsets/US_ASCII)]
++    (if (= line "")
++      (next-request state)
++      state)
++    (when-not (< (.limit buffer) max-buffer-size)
++      (assoc! state ::step :error, ::error :request-header-field-too-large))))
+ 
+ (defn- limit-buffer-to-length [^ByteBuffer buffer ^long length]
+   (if (< length (.remaining buffer))
+@@ -493,12 +514,14 @@
+ (defn- close-response [{::keys [handler state]} exception]
+   (handler state exception))
+ 
+-(defn- write-error-response [{::keys [error request]} socket opts]
++(defn- write-error-response
++  [{::keys [error request handled] :as state} socket opts]
+   (let [done    (volatile! false)
+-        handled (atom false)
++        handled (or handled (atom false))
+         respond (ring-responder request socket handled done opts)
+-        handler (err/error-handlers error)]
+-    (respond (handler request) false)
++        errorf  (err/error-handlers error)]
++    (respond (errorf request) false)
++    (when (::handler state) (close-response state nil))
+     (tcp/close socket)
+     nil))
+ 
+@@ -519,6 +542,7 @@
+                      :headers    (read-header state buffer max-buf-size)
+                      :handler    (run-ring-handler handler state socket opts)
+                      :body       (read-body-stream state socket buffer)
++                     :trailers   (read-trailer state buffer max-buf-size)
+                      :buffer     (buffer-reads state socket)
+                      :error      (write-error-response state socket opts)
+                      nil)]
+@@ -527,5 +551,5 @@
+       ([{::keys [step] :as state} exception]
+        (when exception (error-logger exception))
+        (case step
+-         :body (close-response state exception)
++         (:body :trailers) (close-response state exception)
+          nil)))))
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index 319174a..512d27d 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -490,6 +490,32 @@
+       (is (not (str/includes? response "Hello"))
+           "The request body is not treated as a request"))))
+ 
++(deftest chunked-body-trailer-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [uri body]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (str uri ":" (slurp body))})
++                 {:port 4354})]
++    (let [response (raw-http-request
++                    "localhost" 4354
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Transfer-Encoding: chunked\r\n"
++                         "Connection: close\r\n\r\n"
++                         "5\r\nHello\r\n"
++                         "0\r\n"
++                         "GET /admin HTTP/1.1\r\n"
++                         "\r\n"))]
++      (is (= (str "HTTP/1.1 200 OK\r\n"
++                  "Connection: close\r\n"
++                  "Server: Capra\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 7\r\n\r\n"
++                  "/:Hello")
++             (str/replace response #"Date: (.*?)\r\n" ""))
++          "The trailer section is consumed, not parsed as a request"))))
++
+ (deftest missing-host-header-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

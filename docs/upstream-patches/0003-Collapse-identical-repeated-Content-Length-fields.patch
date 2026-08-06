@@ -1,0 +1,96 @@
+From 521bd116f76ef5e44dffef80049a735a9d229e42 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:18:03 +0000
+Subject: [capra PATCH 03/11] Collapse identical repeated Content-Length fields
+
+Repeated fields are joined with commas by assoc-request-header!, so two
+`Content-Length: 5` lines arrived as "5,5" and failed to parse. RFC 9112
+section 6.3 permits identical duplicates to be collapsed to one value and
+requires rejection only when the values differ, so a legal request was
+being refused.
+
+Collapse the joined value when every member is the same, and leave the
+rest to the 1*DIGIT check, which now answers 400 rather than throwing.
+---
+ src/capra/http.clj         | 15 ++++++++++++---
+ test/capra/server_test.clj | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 9c6630d..a31a17e 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -144,13 +144,22 @@
+ 
+ (def ^:private re-decimal #"\d+")
+ 
++(defn- collapse-duplicates
++  "Return the single member of a comma-separated field value, or nil if it has
++  more than one distinct member."
++  [^String value]
++  (let [values (distinct (str/split value #"," -1))]
++    (when (= 1 (count values)) (first values))))
++
+ (defn- parse-content-length
+   "Parse a Content-Length field value into a long, or return nil if it is not
+   the 1*DIGIT grammar of RFC 9112 section 6.2, or does not fit into a signed
+-  64-bit integer."
++  64-bit integer. Repeated fields have been joined with commas by then, and
++  collapse to one value if they are identical."
+   [^String value]
+-  (when (re-matches re-decimal value)
+-    (try (Long/parseLong value) (catch NumberFormatException _ nil))))
++  (when-some [value (collapse-duplicates value)]
++    (when (re-matches re-decimal value)
++      (try (Long/parseLong value) (catch NumberFormatException _ nil)))))
+ 
+ (defn- request-content-length
+   "Return the request's Content-Length as a long, `::invalid` if the field is
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index c2dd65c..319174a 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -456,6 +456,40 @@
+         (is (not (str/includes? response "/admin"))
+             (str "Content-Length: " (pr-str value) " smuggles nothing"))))))
+ 
++(deftest duplicate-content-length-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [body]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (slurp body)})
++                 {:port 4353})]
++    (let [response (raw-http-request
++                    "localhost" 4353
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Content-Length: 5\r\n"
++                         "Content-Length: 5\r\n"
++                         "Connection: close\r\n\r\n"
++                         "Hello"))]
++      (is (str/ends-with? response "\r\n\r\nHello")
++          "Identical repeated Content-Length fields collapse to one value"))
++    (let [response (raw-http-request
++                    "localhost" 4353
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Content-Length: 5\r\n"
++                         "Content-Length: 6\r\n\r\n"
++                         "Hello"))]
++      (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                  "Server: Capra\r\n"
++                  "Connection: close\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 50\r\n\r\n"
++                  "Invalid \"Content-Length\" header in request: \"5,6\".")
++             (str/replace response #"Date: (.*?)\r\n" "")))
++      (is (not (str/includes? response "Hello"))
++          "The request body is not treated as a request"))))
++
+ (deftest missing-host-header-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

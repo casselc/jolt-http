@@ -1,0 +1,137 @@
+From 4b92e6aea8ecfa5b05f7bdc2c652f24f86dadaee Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:17:18 +0000
+Subject: [capra PATCH 02/11] Validate the request Content-Length field
+
+content-length was `(some-> content-length Long/parseLong)`, which is the
+wrong acceptor for the 1*DIGIT grammar of RFC 9112 section 6.2. It
+accepts a leading sign, so `Content-Length: -5` yielded -5, which is
+truthy in read-body-stream's cond and not positive in
+read-known-length-body-stream, so the connection advanced to the next
+request with no body bytes consumed and the body was parsed as a
+pipelined request. It also throws on anything else it cannot parse, and
+the NumberFormatException unwinds into the reactor's read arity, so a
+value such as `0x5` or an empty one got no response at all -- and,
+because the offending bytes stay in the read buffer, the read arity is
+re-entered and throws again for as long as the connection lives.
+
+Parse the field against 1*DIGIT bounded to a signed 64-bit integer, and
+answer 400 when it does not match.
+---
+ src/capra/http.clj         | 21 ++++++++++++++++++++-
+ src/capra/http/error.clj   |  5 +++++
+ test/capra/server_test.clj | 36 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index c0c8f98..9c6630d 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -142,6 +142,23 @@
+ (defn- content-length [{:strs [content-length]}]
+   (some-> content-length Long/parseLong))
+ 
++(def ^:private re-decimal #"\d+")
++
++(defn- parse-content-length
++  "Parse a Content-Length field value into a long, or return nil if it is not
++  the 1*DIGIT grammar of RFC 9112 section 6.2, or does not fit into a signed
++  64-bit integer."
++  [^String value]
++  (when (re-matches re-decimal value)
++    (try (Long/parseLong value) (catch NumberFormatException _ nil))))
++
++(defn- request-content-length
++  "Return the request's Content-Length as a long, `::invalid` if the field is
++  present but malformed, or nil if it is absent."
++  [{:strs [content-length]}]
++  (when content-length
++    (or (parse-content-length content-length) ::invalid)))
++
+ (defn- chunked-transfer? [{:strs [transfer-encoding]}]
+   (.equalsIgnoreCase "chunked" transfer-encoding))
+ 
+@@ -385,7 +402,7 @@
+       ::state    (handler socket)
+       ::done     done
+       ::chunked? (chunked-transfer? (:headers req))
+-      ::length   (content-length (:headers req))})))
++      ::length   (request-content-length (:headers req))})))
+ 
+ (defn- run-simple-handler [ring-handler request socket opts]
+   (let [done    (volatile! false)
+@@ -407,6 +424,8 @@
+     {::step :error, ::error :unsupported-transfer-encoding, ::request request}
+     (conflicting-framing? request)
+     {::step :error, ::error :conflicting-request-framing, ::request request}
++    (= ::invalid (request-content-length (:headers request)))
++    {::step :error, ::error :invalid-content-length, ::request request}
+     (not (contains? (:headers request) "host"))
+     {::step :error, ::error :missing-host-header, ::request request}
+     (empty-request-body? request)
+diff --git a/src/capra/http/error.clj b/src/capra/http/error.clj
+index a2f0568..5a76ce5 100644
+--- a/src/capra/http/error.clj
++++ b/src/capra/http/error.clj
+@@ -23,6 +23,11 @@
+     (plaintext-response
+      400 (str "Both \"Content-Length\" and \"Transfer-Encoding\" headers in"
+               " request.")))
++   :invalid-content-length
++   (fn [{{:strs [content-length]} :headers}]
++     (plaintext-response
++      400 (str "Invalid \"Content-Length\" header in request: \""
++               content-length "\".")))
+    :missing-host-header
+    (constantly (plaintext-response 400 "Missing \"Host\" header in request."))
+    :http-version-not-supported
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index e9195ed..c2dd65c 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -420,6 +420,42 @@
+       (is (not (str/includes? response "/admin"))
+           "The smuggled request does not reach the handler"))))
+ 
++(deftest invalid-content-length-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [uri]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (str "Handled " uri)})
++                 {:port 4352})]
++    (let [response (raw-http-request
++                    "localhost" 4352
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Content-Length: -5\r\n\r\n"
++                         "GET /admin HTTP/1.1\r\n"
++                         "Host: localhost\r\n\r\n"))]
++      (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                  "Server: Capra\r\n"
++                  "Connection: close\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 49\r\n\r\n"
++                  "Invalid \"Content-Length\" header in request: \"-5\".")
++             (str/replace response #"Date: (.*?)\r\n" "")))
++      (is (not (str/includes? response "/admin"))
++          "The smuggled request does not reach the handler"))
++    (doseq [value ["+5" "0x5" "" "5 5" "abc" "99999999999999999999"]]
++      (let [response (raw-http-request
++                      "localhost" 4352
++                      (str "POST / HTTP/1.1\r\n"
++                           "Host: localhost\r\n"
++                           "Content-Length: " value "\r\n\r\n"
++                           "GET /admin HTTP/1.1\r\n"
++                           "Host: localhost\r\n\r\n"))]
++        (is (str/starts-with? response "HTTP/1.1 400 Bad Request\r\n")
++            (str "Content-Length: " (pr-str value) " is rejected"))
++        (is (not (str/includes? response "/admin"))
++            (str "Content-Length: " (pr-str value) " smuggles nothing"))))))
++
+ (deftest missing-host-header-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

@@ -1,0 +1,142 @@
+From 2f5ca4bc2ae9340b2ff246f8fed93d9e7302fab7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:21:12 +0000
+Subject: [capra PATCH 05/11] Parse the chunk size against the 1*HEXDIG grammar
+
+`Long/parseLong` with radix 16 is the wrong acceptor for chunk-size. RFC
+9112 section 7.1 defines it as `chunk-size [ chunk-ext ]`, so a legal
+`5;name=value` threw a NumberFormatException that unwound into the
+reactor and dropped the connection with no response. parseLong also
+accepts a leading sign, so a `-5` chunk size was admitted and then set
+the buffer's limit below its position.
+
+Match `1*HEXDIG` optionally followed by a chunk extension, ignore the
+extension, and answer 400 for anything else. Values that do not fit a
+signed 64-bit integer are rejected rather than thrown on.
+---
+ src/capra/http.clj         | 37 +++++++++++++++++++++++++------------
+ src/capra/http/error.clj   |  3 +++
+ test/capra/server_test.clj | 32 ++++++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 241e8b3..905d91b 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -443,22 +443,34 @@
+     :else
+     (run-streaming-handler ring-handler request socket opts)))
+ 
++(def ^:private re-chunk-size #"(?i)([0-9a-f]+)(?:;.*)?")
++
++(defn- parse-chunk-size
++  "Parse a chunk-size line into a long, or return nil if it does not match the
++  `chunk-size [ chunk-ext ]` grammar of RFC 9112 section 7.1. Any chunk
++  extension is ignored."
++  [^String line]
++  (when-some [[_ digits] (re-matches re-chunk-size line)]
++    (try (Long/parseLong digits 16) (catch NumberFormatException _ nil))))
++
+ (defn- read-chunk!
+   "Read the next chunk of a chunked request body, advancing the buffer past it.
+   Returns a buffer limited to the chunk data, `::last-chunk` if the chunk size
+-  was zero, or nil if the buffer does not yet hold the whole chunk. Only the
+-  chunk-size line of the last chunk is consumed; what follows it is the trailer
+-  section."
++  was zero, `::invalid` if the chunk size is malformed, or nil if the buffer
++  does not yet hold the whole chunk. Only the chunk-size line of the last chunk
++  is consumed; what follows it is the trailer section."
+   [^ByteBuffer buffer]
+   (let [chunked-buffer (.duplicate buffer)]
+     (when-some [head (buf/read-line chunked-buffer StandardCharsets/US_ASCII)]
+-      (let [start  (.position chunked-buffer)
+-            length (Long/parseLong head 16)]
+-        (if (zero? length)
+-          (do (.position buffer start) ::last-chunk)
+-          (when (<= (+ start length 2) (.limit buffer))
+-            (.position buffer (+ start length 2))
+-            (doto chunked-buffer (.limit (+ start length)))))))))
++      (if-some [length (parse-chunk-size head)]
++        (let [start        (.position chunked-buffer)
++              ^long length length]
++          (if (zero? length)
++            (do (.position buffer start) ::last-chunk)
++            (when (<= (+ start length 2) (.limit buffer))
++              (.position buffer (+ start length 2))
++              (doto chunked-buffer (.limit (+ start length))))))
++        ::invalid))))
+ 
+ (defn- next-request [{::keys [done handler state]}]
+   (handler state nil)
+@@ -467,8 +479,9 @@
+ (defn- read-chunked-body-stream
+   [{::keys [handler state] :as st} socket buffer]
+   (when-some [chunk (read-chunk! buffer)]
+-    (if (= ::last-chunk chunk)
+-      (assoc! st ::step :trailers)
++    (condp = chunk
++      ::last-chunk (assoc! st ::step :trailers)
++      ::invalid    (assoc! st ::step :error, ::error :invalid-chunk-size)
+       (do (handler state socket chunk) st))))
+ 
+ ;; The trailer section is read and discarded. It is not exposed to the handler,
+diff --git a/src/capra/http/error.clj b/src/capra/http/error.clj
+index 5a76ce5..1991d18 100644
+--- a/src/capra/http/error.clj
++++ b/src/capra/http/error.clj
+@@ -28,6 +28,9 @@
+      (plaintext-response
+       400 (str "Invalid \"Content-Length\" header in request: \""
+                content-length "\".")))
++   :invalid-chunk-size
++   (constantly
++    (plaintext-response 400 "Invalid chunk size in request body."))
+    :missing-host-header
+    (constantly (plaintext-response 400 "Missing \"Host\" header in request."))
+    :http-version-not-supported
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index 512d27d..eefea19 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -516,6 +516,38 @@
+              (str/replace response #"Date: (.*?)\r\n" ""))
+           "The trailer section is consumed, not parsed as a request"))))
+ 
++(deftest chunk-size-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [body]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (slurp body)})
++                 {:port 4355})]
++    (let [response (raw-http-request
++                    "localhost" 4355
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Transfer-Encoding: chunked\r\n"
++                         "Connection: close\r\n\r\n"
++                         "5;name=value\r\nHello\r\n0\r\n\r\n"))]
++      (is (str/ends-with? response "\r\n\r\nHello")
++          "A chunk extension is ignored, not rejected"))
++    (doseq [size ["-5" "+5" "0x5" " 5" ""]]
++      (let [response (raw-http-request
++                      "localhost" 4355
++                      (str "POST / HTTP/1.1\r\n"
++                           "Host: localhost\r\n"
++                           "Transfer-Encoding: chunked\r\n\r\n"
++                           size "\r\nHello\r\n0\r\n\r\n"))]
++        (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                    "Server: Capra\r\n"
++                    "Connection: close\r\n"
++                    "Content-Type: text/plain; charset=UTF-8\r\n"
++                    "Content-Length: 35\r\n\r\n"
++                    "Invalid chunk size in request body.")
++               (str/replace response #"Date: (.*?)\r\n" ""))
++            (str "Chunk size " (pr-str size) " is rejected"))))))
++
+ (deftest missing-host-header-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+

@@ -1,0 +1,107 @@
+From 5e501f82f6ca37220e7bf7b631a3d5ea20d894da Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:22:55 +0000
+Subject: [capra PATCH 07/11] Require request header field names to be tokens
+
+parse-header took everything before the first colon as the field name
+with no validation, so `Content-Length : 5` produced the key
+"content-length " -- a header Capra does not recognise as Content-Length
+but a front end that trims does, which is the disagreement RFC 9112
+section 5.1 requires a 400 for. An obs-fold continuation line such as
+" foo: bar" was likewise accepted, as a field named " foo".
+
+Check the name against the token grammar of RFC 9110 section 5.6.2.
+Because SP and HTAB are not token characters, that also rejects every
+obs-fold line, as RFC 9112 section 5.2 requires of a server that does not
+support folding.
+---
+ src/capra/http.clj         | 22 ++++++++++++++++++----
+ test/capra/server_test.clj | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/src/capra/http.clj b/src/capra/http.clj
+index 63ca240..644c3c6 100644
+--- a/src/capra/http.clj
++++ b/src/capra/http.clj
+@@ -86,16 +86,30 @@
+     (assoc! headers name (str existing-val "," value))
+     (assoc! headers name value)))
+ 
++(def ^:private re-token #"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
++
++(defn- invalid-header [line]
++  {::step    :error
++   ::error   :invalid-request-header
++   ::request {:bad-header line}})
++
++;; A field name must be a token, which rules out whitespace before the colon.
++;; It also rules out an obs-fold continuation line, as that begins with SP or
++;; HTAB, and RFC 9112 section 5.2 requires a server that does not support
++;; obs-fold to reject it.
++
+ (defn- parse-header [{:keys [headers] :as state} ^String line]
+   (if-pos [colon-index (.indexOf line COLON)]
+     (let [name  (str/lower-case (subs line 0 colon-index))
+           value (str/trim (subs line (inc colon-index)))]
+-      (if (and (= name "host") (headers name))
++      (cond
++        (not (re-matches re-token name))
++        (invalid-header line)
++        (and (= name "host") (headers name))
+         {::step :error, ::error :duplicate-host-header}
++        :else
+         (assoc! state :headers (assoc-request-header! headers name value))))
+-    {::step    :error
+-     ::error   :invalid-request-header
+-     ::request {:bad-header line}}))
++    (invalid-header line)))
+ 
+ (defn- read-header [{:keys [headers] :as state} buffer ^long max-buffer-size]
+   (if-some [line (buf/read-line buffer StandardCharsets/US_ASCII)]
+diff --git a/test/capra/server_test.clj b/test/capra/server_test.clj
+index ac54832..8d4836d 100644
+--- a/test/capra/server_test.clj
++++ b/test/capra/server_test.clj
+@@ -649,6 +649,39 @@
+                   "Invalid HTTP request header line: \"InvalidHeader\".")
+              (str/replace response #"Date: (.*?)\r\n" ""))))))
+ 
++(deftest non-token-request-header-test
++  (with-open [_ (capra/run-server
++                 (fn handler [{:keys [uri]}]
++                   {:status  200
++                    :headers {"Content-Type" "text/plain; charset=UTF-8"}
++                    :body    (str "Handled " uri)})
++                 {:port 4357})]
++    (let [response (raw-http-request
++                    "localhost" 4357
++                    (str "POST / HTTP/1.1\r\n"
++                         "Host: localhost\r\n"
++                         "Content-Length : 5\r\n\r\n"
++                         "GET /admin HTTP/1.1\r\n"
++                         "Host: localhost\r\n\r\n"))]
++      (is (= (str "HTTP/1.1 400 Bad Request\r\n"
++                  "Server: Capra\r\n"
++                  "Connection: close\r\n"
++                  "Content-Type: text/plain; charset=UTF-8\r\n"
++                  "Content-Length: 55\r\n\r\n"
++                  "Invalid HTTP request header line: \"Content-Length : 5\".")
++             (str/replace response #"Date: (.*?)\r\n" ""))
++          "Whitespace before the colon is rejected")
++      (is (not (str/includes? response "/admin"))
++          "The smuggled request does not reach the handler"))
++    (doseq [line [" folded: value" "\tfolded: value" "Bad(Name): value"]]
++      (let [response (raw-http-request
++                      "localhost" 4357
++                      (str "GET / HTTP/1.1\r\n"
++                           "Host: localhost\r\n"
++                           line "\r\n\r\n"))]
++        (is (str/starts-with? response "HTTP/1.1 400 Bad Request\r\n")
++            (str "The header line " (pr-str line) " is rejected"))))))
++
+ (deftest file-response-body-test
+   (with-open [_ (capra/run-server
+                  (fn handler [_request]
+-- 
+2.43.0
+
