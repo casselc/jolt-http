@@ -4,6 +4,10 @@ This document records changes to Jolt and jolt-tcp that would make jolt-http
 safer, smaller, or easier to scale. It is a local planning document, not an
 upstream issue tracker.
 
+For findings about **Capra itself** — defects and gaps in `weavejester/capra`
+that the port surfaced, which are not about Jolt — see
+[`UPSTREAM-CAPRA-FINDINGS.md`](UPSTREAM-CAPRA-FINDINGS.md).
+
 ## Verification baseline
 
 Revalidated 2026-07-23 against:
