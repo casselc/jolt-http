@@ -46,6 +46,20 @@ with a handler echoing `:uri`, and driving raw sockets at it:
 Finding 17's stdout claim is incidentally confirmed too: those stack traces
 arrived on stdout, not stderr.
 
+A second pass added three more, driven against a handler that places
+attacker-controlled bytes into a response header:
+
+| Finding | Payload | Observed on `f7b01e5` |
+| --- | --- | --- |
+| 4 | `Location` containing CRLF + a forged second response | **two responses on the wire**; the injected `X-Injected` header and the forged `PWNED` body were both delivered to the client |
+| 4 | non-integer `:status` | zero responses — the connection is dropped by an NPE in `write-ascii` |
+| 7 | `HEAD` on a 200 route | the full body was written after the header block |
+| 7 | `{:status 204 :body "hello"}` | `Content-Length: 5` and the body were both emitted |
+| 12 | `Content-Length : 5` (space before colon) | **the smuggled `GET /admin` reached the handler** |
+
+Finding 4 is therefore a working HTTP response-splitting attack against
+upstream as it stands, not a latent risk.
+
 Capra's README calls the adapter experimental and not recommended for
 production, and this list should be read in that light — it is a conformance
 review of work in progress, not a report on a shipped server. The rule set is
@@ -63,15 +77,15 @@ same classes those projects found in widely deployed servers.
 | [1](#1) | High | **executed** | smuggling | `Content-Length` **and** `Transfer-Encoding` are both accepted, and Content-Length wins |
 | [2](#2) | High | **executed** | smuggling | A negative `Content-Length` is accepted; the body is then parsed as a pipelined request |
 | [3](#3) | High | **executed** | smuggling | The chunked trailer section is not consumed and is parsed as the next request |
-| [4](#4) | High | reasoned | injection | Response header names and values are written unvalidated (response splitting, CWE-113) |
+| [4](#4) | High | **executed** | injection | Response header names and values are written unvalidated (response splitting, CWE-113) |
 | [5](#5) | High | reasoned | availability | More than 32 synchronous pipelined requests overflow the control queue and kill the connection |
 | [6](#6) | Medium-High | **executed** | availability | A leading bare LF crashes the connection (inherited from `teensyp.buffer/read-line`) |
-| [7](#7) | Medium-High | reasoned | framing | `HEAD` responses carry a body; `204`/`304` are not special-cased |
+| [7](#7) | Medium-High | **executed** | framing | `HEAD` responses carry a body; `204`/`304` are not special-cased |
 | [8](#8) | Medium-High | reasoned | DoS | No aggregate header-count or header-byte limit |
 | [9](#9) | Medium-High | reasoned | correctness | A truncated request body is indistinguishable from a complete one |
 | [10](#10) | Medium-High | reasoned | liveness | An async handler's response sink is never closed, so the connection hangs |
 | [11](#11) | Medium | reasoned | corruption | The `ThreadLocal` response buffer is unsafe on any non-thread-per-task executor |
-| [12](#12) | Medium | reasoned | smuggling | `Foo : bar` and obs-fold lines are accepted as distinct headers |
+| [12](#12) | Medium | **executed** | smuggling | `Foo : bar` and obs-fold lines are accepted as distinct headers |
 | [13](#13) | Medium | **executed** | conformance | Multiple `Host` headers are accepted |
 | [14](#14) | Medium | **executed** | conformance | Chunk extensions are rejected; chunk sizes accept `+`/`-` |
 | [15](#15) | Low-Medium | reasoned | conformance | Malformed or duplicate `Content-Length` closes abruptly instead of answering 400 |
