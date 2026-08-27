@@ -231,7 +231,8 @@
 
 (defn socket-sink
   "A blocking Sink over a teensyp Socket. Each write queues to the socket and
-  parks the calling thread on a promise until the bytes are flushed.
+  parks the calling thread on a failure-aware completion until the bytes are
+  flushed or the connection retires.
 
   This consumes a handler-pool thread for the duration of the body. jolt-tcp
   deliberately runs the write callback which unparks it on a separate callback

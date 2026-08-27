@@ -25,7 +25,8 @@
             [jolt.http.date :as date]
             [jolt.http.fake-socket :as fs]
             [jolt.http.http-model :as m]
-            [teensyp.buffer :as buf]))
+            [teensyp.buffer :as buf]
+            [teensyp.server :as tcp]))
 
 (def ^:private opts
   {:test-cases 200 :database "" :verbosity :quiet})
@@ -389,6 +390,28 @@
         (is (nil? (:error resp)))
         (is (= payload (:body resp))
             "chunk framing excludes prefix and suffix guards")))))
+
+(deftest socket-sink-propagates-failed-write-completion
+  (let [failure (ex-info "peer closed" {:test true})
+        lock (java.util.concurrent.locks.ReentrantLock.)
+        socket (reify
+                 tcp/Socket
+                 (try-write [_ _] false)
+                 (queue-control [_ _ _] nil)
+                 (queue-write [_ _ _] nil)
+                 (socket-info [_] {})
+                 (socket-lock [_] lock)
+                 tcp/CompletionSocket
+                 (queue-write-completion [_ _ completion]
+                   (deliver completion {:status :failed :exception failure})))
+        sink (body/socket-sink socket)
+        caught (try
+                 (let [bytes (.getBytes "event" "UTF-8")]
+                   (body/sink-write! sink bytes 0 (alength bytes))
+                   nil)
+                 (catch Throwable error error))]
+    (is (identical? failure caught)
+        "a retired peer releases the blocking response writer with its cause")))
 
 (deftest chunked-sink-round-trips-through-the-model-dechunker
   (with (assoc opts :name "body/chunked-sink")

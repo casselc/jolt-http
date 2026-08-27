@@ -23,9 +23,9 @@
   Two deliberate differences from the reactor, both of which make the harness
   *stricter* rather than more forgiving:
 
-  - Writes complete instantly and their callbacks fire synchronously, inside
-    `tcp/write`. `body/socket-sink` queues with a callback that delivers a
-    promise and then derefs it, so delivering first is safe; a handler that
+  - Writes complete instantly and their completions settle synchronously, inside
+    `tcp/write-completion`. `body/socket-sink` waits on that completion, so
+    delivering first is safe; a handler that
     depended on the callback being deferred would be relying on reactor timing
     it is not promised.
   - There is no socket buffer, so a write never reports EAGAIN. The partial-send
