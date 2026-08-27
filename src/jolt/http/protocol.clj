@@ -1100,6 +1100,18 @@
     ;; second time, and tear the socket down before the first one had drained.
     {::step :done}))
 
+(defn- peer-disconnect?
+  "True when `exception` represents the peer ending a connection while a
+  response is in flight. This is normal cancellation for streaming responses,
+  not an application/server failure worth reporting through `:error-logger`."
+  [exception]
+  (loop [exception exception]
+    (when exception
+      (let [data (ex-data exception)]
+        (or (= :connection-reset (:jolt.net/kind data))
+            (= :teensyp.server/socket-closed (:err data))
+            (recur (ex-cause exception)))))))
+
 (defn tcp-handler
   "Create a jolt-tcp (teensyp) handler from a Ring handler."
   [handler {:keys [error-logger response-buffer-size port server-name remote-addr
@@ -1144,7 +1156,8 @@
            (recur new-state)
            state))))
     ([state exception]
-     (when exception (error-logger exception))
+     (when (and exception (not (peer-disconnect? exception)))
+       (error-logger exception))
      ;; A connection closing mid-body must unblock a handler waiting on the body.
      ;; The read arity uses transients. If it throws after persistent! has consumed
      ;; the current state but before returning its replacement, jolt-tcp passes

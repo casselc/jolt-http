@@ -1051,6 +1051,21 @@
            ["original parser failure"]
            (mapv ex-message @logged))))
 
+(defn- test-peer-disconnect-is-not-logged []
+  (let [logged  (atom [])
+        handler (protocol/tcp-handler
+                 (fn [_] nil)
+                 {:error-logger #(swap! logged conj %)})]
+    (handler {} (ex-info "peer reset" {:jolt.net/kind :connection-reset}))
+    (handler {} (ex-info "socket retired" {:err :teensyp.server/socket-closed}
+                              (ex-info "peer reset"
+                                       {:jolt.net/kind :connection-reset})))
+    (check "peer disconnect is normal response cancellation" [] @logged)
+    (handler {} (ex-info "application failure" {:err ::application-failure}))
+    (check "non-peer failures still reach the error logger"
+           ["application failure"]
+           (mapv ex-message @logged))))
+
 (defn- test-custom-error-handler []
   (with-server {:handler (fn [_] (throw (ex-info "boom" {})))
                 :error-logger (fn [_])
@@ -1404,6 +1419,7 @@
    ["Content-Length overflow" test-content-length-overflow]
    ["exception handling"   test-exception-handling]
    ["exception cleanup"    test-close-after-spent-parser-state]
+   ["peer disconnect logging" test-peer-disconnect-is-not-logged]
    ["custom error handler" test-custom-error-handler]
    ["async handler"        test-async-handler]
    ["async streamable bodies" test-async-streamable-bodies-finalize]
