@@ -169,6 +169,17 @@
       ;; deliberately idempotent so this still emits one terminator.
       (body/sink-close! sink))))
 
+(defrecord FlushBeforeCloseBody [flushed release])
+
+(extend-type FlushBeforeCloseBody
+  body/StreamableBody
+  (write-body-to-sink [this _response sink]
+    (let [event (utf8 "event: ready\n\n")]
+      (body/sink-write! sink event 0 (alength event))
+      (body/sink-flush! sink)
+      (deliver (:flushed this) true)
+      @(:release this))))
+
 ;; --- scenarios -------------------------------------------------------------
 
 (defn- test-basic []
@@ -1093,6 +1104,29 @@
           (check (str "async " path " emits exactly one status line")
                  1 (count (re-seq #"HTTP/1\.1 " wire)))))))))
 
+(defn- test-flushable-stream-emits-before-close []
+  (let [flushed (promise)
+        release (promise)
+        stream (->FlushBeforeCloseBody flushed release)]
+    (with-server (fn [_] {:status 200
+                          :headers {"Content-Type" "text/event-stream"}
+                          :body stream})
+      (fn [p]
+        (let [fd (net/connect-loopback p)]
+          (try
+            (net/client-send-all fd (utf8 (get-request "/events")))
+            (check "live body reaches its explicit flush boundary"
+                   true (deref flushed 2000 false))
+            (let [received (future (some-> (net/client-recv fd 8192) ->str))
+                  prefix (deref received 2000 :timeout)]
+              (check "flushed live event arrives before response close"
+                     true
+                     (and (string? prefix)
+                          (str/includes? prefix "event: ready\n\n"))))
+            (finally
+              (deliver release true)
+              (net/close! fd))))))))
+
 (defn- test-async-raise []
   (with-server {:async? true
                 :error-logger (fn [_])
@@ -1373,6 +1407,7 @@
    ["custom error handler" test-custom-error-handler]
    ["async handler"        test-async-handler]
    ["async streamable bodies" test-async-streamable-bodies-finalize]
+   ["flushable stream"     test-flushable-stream-emits-before-close]
    ["async raise"          test-async-raise]
    ["date header format"   test-date-header-format]
    ["concurrency"          test-concurrency]

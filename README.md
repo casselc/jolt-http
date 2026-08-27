@@ -84,7 +84,10 @@ support your own type:
   MyType
   (write-body-to-sink [this _response sink]
     (let [bs (.getBytes (render this) "UTF-8")]
-      (body/sink-write! sink bs 0 (alength bs)))))
+      (body/sink-write! sink bs 0 (alength bs))
+      ;; Long-lived bodies such as SSE must expose each complete event without
+      ;; closing the response. This is a no-op for an unbuffered custom Sink.
+      (body/sink-flush! sink))))
 ```
 
 `write-body-to-sink` is synchronous: it must finish producing the body before

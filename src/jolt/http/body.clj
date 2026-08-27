@@ -229,6 +229,20 @@
   (sink-write! [sink bs off len])
   (sink-close! [sink]))
 
+(defprotocol FlushableSink
+  "Optional additive capability for a streaming body that must make buffered
+  bytes visible before the response body closes. Calling `sink-flush!` on a
+  plain Sink is a no-op, so bodies remain compatible with recording and custom
+  sinks that do not buffer."
+  (sink-flush! [sink]))
+
+(extend-protocol FlushableSink
+  Object
+  (sink-flush! [_] nil)
+
+  nil
+  (sink-flush! [_] nil))
+
 (defn socket-sink
   "A blocking Sink over a teensyp Socket. Each write queues to the socket and
   parks the calling thread on a failure-aware completion until the bytes are
@@ -309,7 +323,17 @@
             (when-not @closed
               (vreset! closed true)
               (flush-buffer!)
-              (sink-close! sink))))))))
+              (sink-close! sink))))
+
+        FlushableSink
+        (sink-flush! [_]
+          (with-lock lock
+            (when @closed
+              (throw (ex-info "Sink closed" {:err ::sink-closed})))
+            (flush-buffer!)
+            ;; Preserve a downstream flush boundary if another buffering sink
+            ;; is introduced below this one.
+            (sink-flush! sink)))))))
 
 (defn chunked-sink
   "Wrap a Sink so each write becomes an HTTP chunk, and close emits the

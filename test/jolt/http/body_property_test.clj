@@ -342,6 +342,34 @@
       (is (nil? (:error resp)))
       (is (= [1 2 3 4 5] (:body resp))))))
 
+(deftest coalescing-sink-supports-live-flush-without-closing
+  (let [writes (atom [])
+        closes (atom 0)
+        target (reify body/Sink
+                 (sink-write! [_ bs off len]
+                   (swap! writes conj
+                          (subvec (m/->octets bs)
+                                  (long off)
+                                  (+ (long off) (long len)))))
+                 (sink-close! [_] (swap! closes inc)))
+        sink (body/coalescing-sink target 32)
+        first-event (m/->ba (m/ascii "event: first\n\n"))
+        second-event (m/->ba (m/ascii "event: second\n\n"))]
+    (body/sink-write! sink first-event 0 (alength first-event))
+    (is (empty? @writes) "a partial buffer remains coalesced by default")
+    (body/sink-flush! sink)
+    (is (= [(m/ascii "event: first\n\n")] @writes)
+        "flush exposes a partial live event before body close")
+    (is (zero? @closes) "flush does not terminate the response")
+    (body/sink-write! sink second-event 0 (alength second-event))
+    (body/sink-flush! sink)
+    (is (= [(m/ascii "event: first\n\n")
+            (m/ascii "event: second\n\n")]
+           @writes)
+        "later live events retain their own flush boundaries")
+    (body/sink-close! sink)
+    (is (= 1 @closes))))
+
 (deftest sink-chain-finalization-is-observably-exactly-once
   (let [wire   (atom [])
         closes (atom 0)
