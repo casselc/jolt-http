@@ -9,7 +9,7 @@
 
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "ba040f1f2a664e72c9d650f7f8ca8b17368ec89c"}}
+         :git/sha "7705bd19978bda4e606d4dfc2324e941e3283a7c"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public
