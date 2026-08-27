@@ -1,7 +1,7 @@
 ;; jolt-http — a Capra-style HTTP/1.1 server for jolt (Clojure on Chez Scheme).
 ;; An incremental HTTP/1.1 parser and Ring-shaped handler contract layered over
-;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with the reviewed
-;; fork compiler and `-M:test`.
+;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with Jolt v0.7.27
+;; or newer and `jolt -M:test`.
 ;;
 ;; jolt.net, reached transitively through jolt-tcp, declares the native socket
 ;; libraries it needs. They must NOT be redeclared at the HTTP layer.
@@ -9,19 +9,19 @@
 
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "81cfa68cc71f91d67da36d68143f3679e25277c2"}}
+         :git/sha "ba040f1f2a664e72c9d650f7f8ca8b17368ec89c"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public
  ;; direct-libhegel branch commit. Because the dep is alias-scoped, the installer
  ;; needs the alias too:
- ;; `JOLT_CACHE_DIR=.jolt-cache/jolt-hegel-<sha> joltc -A:test -m hegel.install`
+ ;; `JOLT_CACHE_DIR=.jolt-cache/jolt-hegel-<sha> jolt -A:test -m hegel.install`
  ;; (the cache is keyed by the pinned SHA so another release cannot reuse its
  ;; compiled namespaces).
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.chucklehead-dev/jolt-hegel
                                {:git/url "https://github.com/chucklehead-dev/jolt-hegel.git"
-                                :git/sha "4910faed4dc86ee54c6afc1a99dcb9a5bca6e840"}}
+                                :git/sha "53631c81cd927175935037699ddf687d98a44d24"}}
                   :main-opts ["-m" "jolt.http.server-test"]}}
 
- :tasks {test "joltc -M:test"}}
+ :tasks {test "jolt -M:test"}}
