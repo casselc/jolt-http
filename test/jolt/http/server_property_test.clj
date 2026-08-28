@@ -101,9 +101,15 @@
   call returns — shrinking and final replay both need it."
   [opts f]
   (let [srv  (apply http/run-server (:handler opts)
-                    (apply concat (merge {:port 0 :reuse-address? true
-                                          :error-logger (fn [_])}
-                                         (dissoc opts :handler))))
+                    (apply concat
+                           (merge {:port 0 :reuse-address? true
+                                   :error-logger
+                                   (fn [error]
+                                     (swap! events conj
+                                            ["server/error"
+                                             {:message (ex-message error)
+                                              :data (ex-data error)}]))}
+                                  (dissoc opts :handler))))
         port (:port srv)]
     (try (f port) (finally (http/stop-server srv)))))
 
