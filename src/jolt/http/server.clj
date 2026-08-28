@@ -20,7 +20,10 @@
 
 (defn- async-handler [handler]
   (fn [request respond raise]
-    (handler request #(respond % true) raise)))
+    (try
+      (handler request #(respond % true) raise)
+      (catch :default ex
+        (raise ex)))))
 
 (defn- sync-handler [handler]
   (fn [request respond raise]

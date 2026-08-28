@@ -1152,6 +1152,28 @@
     (fn [p]
       (check "async raise -> 500" 500 (status-of (request p (get-request "/")))))))
 
+(defn- test-async-synchronous-throw []
+  (let [logged (atom [])]
+    (with-server {:async? true
+                  :error-logger #(swap! logged conj %)
+                  :handler (fn [_request _respond _raise]
+                             (throw (ex-info "async handler threw" {})))}
+      (fn [p]
+        (check "bodyless async handler throw -> 500"
+               500
+               (status-of (request p (get-request "/throw"))))
+        (check "streaming-request async handler throw -> 500"
+               500
+               (status-of
+                (request p
+                         (str "POST /throw HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Content-Length: 3\r\n"
+                              "Connection: close\r\n\r\nabc"))))
+        (check "both synchronous async-handler failures remain observable"
+               ["async handler threw" "async handler threw"]
+               (mapv ex-message @logged))))))
+
 (defn- test-concurrency
   "The pool-size deadlock guard: many simultaneous connections, each with a
   handler slow enough that they overlap."
@@ -1453,6 +1475,7 @@
    ["async streamable bodies" test-async-streamable-bodies-finalize]
    ["flushable stream"     test-flushable-stream-emits-before-close]
    ["async raise"          test-async-raise]
+   ["async synchronous throw" test-async-synchronous-throw]
    ["date header format"   test-date-header-format]
    ["concurrency"          test-concurrency]
    ["pool-size sequential responses"
