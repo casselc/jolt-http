@@ -1,6 +1,6 @@
 ;; jolt-http — a Capra-style HTTP/1.1 server for jolt (Clojure on Chez Scheme).
 ;; An incremental HTTP/1.1 parser and Ring-shaped handler contract layered over
-;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with Jolt v0.7.27
+;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with Jolt v0.7.28
 ;; or newer and `jolt -M:test`.
 ;;
 ;; jolt.net, reached transitively through jolt-tcp, declares the native socket
@@ -9,7 +9,7 @@
 
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "fbffee3fab99240836ffae225e752657c21c4fa8"}}
+         :git/sha "6245307eb5890d0addb10c0f8e4e3b7a55f5b85c"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public

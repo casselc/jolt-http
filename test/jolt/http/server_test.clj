@@ -6,7 +6,7 @@
   client so that malformed requests, pipelining and half-written requests can be
   driven exactly.
 
-  `-main` exits non-zero if anything fails, so `joltc -M:test` gates CI. The
+  `-main` exits non-zero if anything fails, so `jolt -M:test` gates CI. The
   explicit `System/exit` is required: core.async keeps non-daemon threads alive
   and the process would otherwise hang on return."
   (:require [clojure.edn :as edn]
@@ -1464,7 +1464,7 @@
    ;; Generative layers (jolt-hegel). The pure and in-process properties run
    ;; under clojure.test via hegel.clojure-test/with; the loopback properties
    ;; use hegel.core/run-test! directly and count their own failures. Both fold
-   ;; into the same total, so `joltc -M:test` stays the single gate.
+   ;; into the same total, so `jolt -M:test` stays the single gate.
    ;;
    ;; They get a longer watchdog than the acceptance scenarios: each runs
    ;; hundreds of generated cases, and on a shrink it replays the property again

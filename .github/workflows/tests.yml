@@ -80,23 +80,23 @@ jobs:
           "$bindir/chez" --version | tee /tmp/chez-version
           grep -Fq '10.4.1' /tmp/chez-version
 
-      - name: Checkout pinned Jolt fork
+      - name: Checkout pinned aspect-capable Jolt
         uses: actions/checkout@v4
         with:
           repository: casselc/jolt
-          ref: ecf7728f15d8b8f858327c47dbd8b751eb36798c
+          ref: c666a2d0175923cb7edeb36fb99c7e2c657af375
           submodules: recursive
           path: jolt
 
       - name: Install libhegel
         shell: bash
         run: |
-          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" \
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" \
             -A:test -m hegel.install
 
       - name: Run tests
         shell: bash
         run: |
-          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/joltc" -M:test
+          JOLT_PWD="$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/jolt/bin/jolt" -M:test
 
 # Windows is intentionally absent until jolt.net has a Windows readiness poller.

@@ -235,7 +235,7 @@ bug *classes* it documents, with payloads written from the RFC grammar.
 Conformance is also checked with [h1spec][], which runs against a live server:
 
 ```
-joltc run dev/h1spec-server.clj &      # or any server you like
+jolt run dev/h1spec-server.clj &      # or any server you like
 h1spec --strict 127.0.0.1:8080
 ```
 
@@ -248,7 +248,7 @@ h1spec --strict 127.0.0.1:8080
 
 The rules above are pinned by fixed payloads *and* explored generatively, so
 coverage comes from classes of input rather than from a list of remembered
-examples. Three layers, all folded into `joltc -M:test`:
+examples. Three layers, all folded into `jolt -M:test`:
 
 - **Pure properties** (`jolt.http.body-property-test`) — the RFC-1123 date
   arithmetic against an independently written civil-date algorithm, and the
@@ -295,8 +295,8 @@ implementation-test boundaries.
 - **The response buffer is per connection**, not per thread: jolt has no usable
   `ThreadLocal` constructor. jolt-tcp calls a connection's handler arities
   serially, so it needs no locking.
-- **The `Date` header** is computed here (jolt's core has no `java.time`) and
-  cached for the current second.
+- **The `Date` header** is computed and cached locally for the current second,
+  keeping HTTP serialization independent of the modeled time API.
 - **No `:direct-read-buffer?`** — jolt has no direct buffers.
 - **The default executor is an explicitly bounded pool.** Capra uses a
   virtual-thread-per-task executor, but jolt has no M:N virtual threads. In
@@ -326,8 +326,8 @@ implementation-test boundaries.
 ## Testing
 
 ```sh
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -A:test -m hegel.install
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc -M:test
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt -A:test -m hegel.install
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt -M:test
 ```
 
 Runs a framework-less acceptance suite plus three generative layers
@@ -341,14 +341,14 @@ instead of failing it.
 Run a subset by naming scenarios:
 
 ```sh
-JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/joltc \
+JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
   -M:test "pipelining" "keep-alive"
 ```
 
-The current reviewed core baseline is
-`ecf7728f15d8b8f858327c47dbd8b751eb36798c`. `deps.edn` pins jolt-tcp at
-`81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins jolt-net
-at `eabf9067f32d0f4c1673b5d84c24484943ea75c5`.
+The current reviewed aspect-capable core baseline is
+`c666a2d0175923cb7edeb36fb99c7e2c657af375`. `deps.edn` pins jolt-tcp at
+`6245307eb5890d0addb10c0f8e4e3b7a55f5b85c`, which transitively pins jolt-net
+at `f2ea68d9adc5a6d7b66cb511351e98e93081aee2`.
 
 Progress is also written to `/tmp/jolt-http-test-progress.log`; jolt block-buffers
 stdout when it is redirected, so on a hang that file is the only record of how

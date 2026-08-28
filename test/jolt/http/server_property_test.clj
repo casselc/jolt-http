@@ -577,11 +577,17 @@
                                          :drained (conj drained spec))))))]
 
                   :invariants
-                  [;; Never more answers on the wire than requests fully sent.
+                  [;; Never more answers on the wire than completed requests,
+                   ;; plus the one terminal parse-error response permitted when
+                   ;; EOF cuts off a partial request.  Hegel found the missing
+                   ;; allowance with the minimal shape: completed request,
+                   ;; partial request, half-close, drain.
                    (hs/invariant :no-extra-responses
-                                 (fn [{:keys [acc pending drained]}]
+                                 (fn [{:keys [acc pending drained partial eof?]}]
                                    (<= (m/status-lines @acc)
-                                       (+ (count pending) (count drained)))))
+                                       (+ (count pending)
+                                          (count drained)
+                                          (if (and eof? partial) 1 0)))))
                    ;; Whatever has arrived so far is either well framed or
                    ;; simply incomplete — never malformed.
                    (hs/invariant :stream-stays-framed

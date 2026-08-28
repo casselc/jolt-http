@@ -71,13 +71,13 @@ behavior so any original parser error remains observable.
 Run the focused companion test with:
 
 ```sh
-joltc -M:test "pipelining" "exception cleanup"
+jolt -M:test "pipelining" "exception cleanup"
 ```
 
 The full gate is:
 
 ```sh
-joltc -M:test
+jolt -M:test
 ```
 
 ### Companion property-harness invariant

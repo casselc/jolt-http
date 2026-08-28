@@ -1,30 +1,26 @@
-# Upstream improvements for jolt-http
+# Historical upstream improvement record for jolt-http
 
 This document records changes to Jolt and jolt-tcp that would make jolt-http
 safer, smaller, or easier to scale. It is a local planning document, not an
 upstream issue tracker.
 
-## Verification baseline
+## Current baseline
 
-Revalidated 2026-07-23 against:
+Revalidated 2026-08-28 against:
 
-- installed `joltc v0.4.15`;
-- Jolt commit `d5aaf503fc7a45c5638d21215eb153b426a7e8dc` in
-  `jolt-tcp/refs/jolt`; and
-- the current local jolt-http and jolt-tcp sources.
+- Jolt v0.7.28 plus the compiler-aspect/FFI/NIO branch at
+  `c666a2d0175923cb7edeb36fb99c7e2c657af375`;
+- jolt-tcp `6245307eb5890d0addb10c0f8e4e3b7a55f5b85c`; and
+- jolt-net `f2ea68d9adc5a6d7b66cb511351e98e93081aee2`.
 
 jolt-http has no direct FFI. It layers an HTTP/1.1 parser and Ring-shaped handler
 contract over jolt-tcp's `jolt.net`-backed readiness reactor, so native safety and byte-transfer
 changes are inherited. See
 [jolt-tcp's detailed upstream document](../../jolt-tcp/docs/UPSTREAM-IMPROVEMENTS.md).
 
-The reviewed Jolt proposal fork is published only to `casselc/jolt` on
-`codex/upstream-improvements-6-8`; nothing has been pushed to the upstream
-project's origin and no pull request has been opened. Its current HTTP
-prerequisites include scoped array ranges at `1c8fdb97`, Windows path handling
-at `358c42b7`, and the variadic FFI boundary at `ecf7728f`. The known-unsound
-runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
-`21062d5b` and is not part of the proposal branch.
+Current work uses released v0.7.28 APIs for Windows paths, variadic FFI, and
+atomic native-error capture. Compiler-selected aspects remain on the explicitly
+pinned `casselc/jolt` branch above; no upstream pull request has been opened.
 
 ## Implementation update — 2026-07-24
 
@@ -32,7 +28,7 @@ runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
   `jolt.net` nor `jolt.ffi`; tests use `jolt.net` only for deterministic native
   failure injection.
 - `deps.edn` pins jolt-tcp at
-  `81cfa68cc71f91d67da36d68143f3679e25277c2`, which transitively pins the
+  `6245307eb5890d0addb10c0f8e4e3b7a55f5b85c`, which transitively pins the
   validated jolt-net revision. CI resolves this immutable graph directly rather
   than cloning mutable sibling branches.
 - Response writes use TCP's outcome-bearing completion API, so reset/failure
@@ -46,7 +42,11 @@ runtime AOT prototype remains isolated on `research/aot-v5-prototype` at
   recommendations below are broader runtime/SPI work, not descriptions of
   workarounds still present in this adapter.
 
-## Priority summary
+## Historical priority summary
+
+The remaining sections preserve the 2026-07 investigation record. They are not
+current Jolt capability claims; verify every item against v0.7.28+ source before
+turning it into implementation work.
 
 | Priority | Upstream area | Independently landable change | Main payoff |
 | --- | --- | --- | --- |
