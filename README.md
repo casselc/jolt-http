@@ -43,6 +43,38 @@ with `with-open`.
 Ring-shaped. Synchronous by default; pass `:async? true` for 3-arity
 `(fn [request respond raise] ...)` handlers.
 
+### Build-selected server instrumentation
+
+The library publishes an inert, provider-neutral aspect manifest at
+`META-INF/jolt/aspects/http-server.edn`. Applications may explicitly select a
+separate consumer at native-image build time:
+
+```clojure
+{:jolt/build
+ {:aspects [{:resource "META-INF/jolt/aspects/http-server.edn"
+             :provider my.otel.http-server}]}}
+```
+
+Its `:http/server` role selects the fixed-arity
+`jolt.http.protocol/invoke-handler` entry. The entry owns the normalized Ring
+handler and both callbacks for one request, so a `:replace-args-v1` consumer can
+wrap `respond` and `raise`. Its companion `:http/server-response` role observes
+the result of `sanitize-response`, after jolt-http has replaced invalid status,
+header, or framing metadata with the actual safe response. In particular, an
+asynchronous handler returning before it invokes either callback does **not**
+complete the instrumentation lifecycle. A consumer can keep its request state
+open, restore it when a callback runs on another thread, observe the response
+jolt-http actually accepted, and finish exactly once after the accepted
+callback returns.
+
+This is a **Ring callback lifecycle**, not a socket-delivery lifecycle. The
+success callback means the adapter accepted and processed the response; known
+length response bytes may still be queued in jolt-tcp, and a peer can disconnect
+before they reach the wire. Instrumentation must not describe this seam as
+kernel-write, peer-receive, or transport completion. The manifest is inert
+unless an application selects a provider and therefore adds no telemetry
+dependency or behavior to jolt-http itself.
+
 The request map carries `:request-method`, `:uri`, `:query-string`, `:headers`
 (lower-cased, repeated headers joined with commas), `:scheme`, `:protocol`,
 `:server-port`, `:server-name`, `:remote-addr` and `:body`.

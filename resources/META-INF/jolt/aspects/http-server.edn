@@ -1,0 +1,15 @@
+{:schema 1
+ :library {:id casselc/jolt-http
+           ;; Compatibility id of the source revision which owns this exact
+           ;; fixed-arity entry seam.  A later resource-only publication may
+           ;; have a different commit without changing this id.
+           :version "3ef772262308bbf6039412366ae80690cec348b0"}
+ :aspects
+ [{:id :http/server-ring-handler
+   :match {:entry jolt.http.protocol/invoke-handler :arity 8}
+   :advice-role :http/server
+   :expect {:matches 1}}
+  {:id :http/server-sanitized-response
+   :match {:entry jolt.http.protocol/sanitize-response :arity 1}
+   :advice-role :http/server-response
+   :expect {:matches 1}}]}

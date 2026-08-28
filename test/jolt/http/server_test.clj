@@ -9,7 +9,9 @@
   `-main` exits non-zero if anything fails, so `joltc -M:test` gates CI. The
   explicit `System/exit` is required: core.async keeps non-daemon threads alive
   and the process would otherwise hang on return."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test]
             [jolt.http.body :as body]
             [jolt.http.date :as date]
@@ -1374,10 +1376,36 @@
     (jolt.http.server-property-test/run-properties!)
     (swap! failures + (- (jolt.http.server-property-test/failure-count) before))))
 
+(defn- test-inert-aspect-manifest []
+  (let [resource (io/resource "META-INF/jolt/aspects/http-server.edn")
+        manifest (some-> resource slurp edn/read-string)
+        [handler-aspect response-aspect] (:aspects manifest)]
+    (check-pred "server aspect manifest is on the ordinary classpath" some? resource)
+    (check "server aspect manifest schema" 1 (:schema manifest))
+    (check "server aspect manifest library"
+           {:id 'casselc/jolt-http
+            :version "3ef772262308bbf6039412366ae80690cec348b0"}
+           (:library manifest))
+    (check "server aspect selects the normalized Ring lifecycle owner"
+           {:entry 'jolt.http.protocol/invoke-handler :arity 8}
+           (:match handler-aspect))
+    (check "server aspect is inert and provider-neutral"
+           {:id :http/server-ring-handler
+            :advice-role :http/server
+            :expect {:matches 1}}
+           (select-keys handler-aspect [:id :advice-role :expect]))
+    (check "server response aspect observes the sanitized response"
+           {:id :http/server-sanitized-response
+            :match {:entry 'jolt.http.protocol/sanitize-response :arity 1}
+            :advice-role :http/server-response
+            :expect {:matches 1}}
+           response-aspect)))
+
 ;; --- runner ----------------------------------------------------------------
 
 (def ^:private scenarios
-  [["date formatting"      test-date-formatting]
+  [["inert aspect manifest" test-inert-aspect-manifest]
+   ["date formatting"      test-date-formatting]
    ["charset parsing"      test-charset-parsing]
    ["basic response"       test-basic]
    ["request map"          test-request-map]
