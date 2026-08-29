@@ -551,7 +551,9 @@
 
 ;; --- Ring handler plumbing -------------------------------------------------
 
-(defn- sanitize-response
+(defn- ^{:jolt.aspects/id :http/server-sanitized-response
+         :jolt.aspects/role :http/server-response}
+  sanitize-response
   "Validate and canonicalize a response before the first byte is written.
 
   Invalid status/header syntax and unrepresentable framing fail closed to a 500.
@@ -724,7 +726,10 @@
   (and (not (contains? headers "content-length"))
        (not (contains? headers "transfer-encoding"))))
 
-(defn- invoke-handler
+(defn- ^{:jolt.aspects/id :http/server-ring-handler
+         :jolt.aspects/role :http/server
+         :jolt.aspects/arity 8}
+  invoke-handler
   "Run the Ring handler. `handled` is the response slot: whoever claims it first
   writes the response, so a body-framing error detected by the parser can lock
   the handler out rather than interleaving two responses on one connection."

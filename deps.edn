@@ -7,6 +7,12 @@
 ;; libraries it needs. They must NOT be redeclared at the HTTP layer.
 {:paths ["src" "resources"]
 
+ :jolt/aspects
+ {:library {:id casselc/jolt-http
+            :version "3ef772262308bbf6039412366ae80690cec348b0"}
+  :namespaces [jolt.http.protocol]
+  :manifest "resources/META-INF/jolt/aspects/http-server.edn"}
+
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
          :git/sha "05379d74bf19f7c4ebc92c68078841b8b7c59fe6"}}
