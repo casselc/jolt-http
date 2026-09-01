@@ -1,15 +1,17 @@
 ;; jolt-http — a Capra-style HTTP/1.1 server for jolt (Clojure on Chez Scheme).
 ;; An incremental HTTP/1.1 parser and Ring-shaped handler contract layered over
-;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with Jolt v0.7.28
+;; jolt-tcp's jolt.net-backed readiness reactor. Run tests with Jolt v0.8.0
 ;; or newer and `jolt -M:test`.
 ;;
 ;; jolt.net, reached transitively through jolt-tcp, declares the native socket
 ;; libraries it needs. They must NOT be redeclared at the HTTP layer.
 {:paths ["src" "resources"]
 
+ :jolt/min-version "0.8.0"
+
  :deps {io.github.casselc/jolt-tcp
         {:git/url "https://github.com/casselc/jolt-tcp.git"
-         :git/sha "05379d74bf19f7c4ebc92c68078841b8b7c59fe6"}}
+         :git/sha "85f67fb76c4c6d392f5dd51821e458d446ebae01"}}
 
  ;; jolt-hegel is test-time only (property/stateful generation via libhegel), so
  ;; it lives in :extra-deps rather than :deps. Pinned to the reviewed public
@@ -21,7 +23,7 @@
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.chucklehead-dev/jolt-hegel
                                {:git/url "https://github.com/chucklehead-dev/jolt-hegel.git"
-                                :git/sha "53631c81cd927175935037699ddf687d98a44d24"}}
+                                :git/sha "bcc4d8da54f51d79044d9ad6bcfb09049f9ac27e"}}
                   :main-opts ["-m" "jolt.http.server-test"]}}
 
  :tasks {test "jolt -M:test"}}

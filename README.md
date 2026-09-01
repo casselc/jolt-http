@@ -345,10 +345,9 @@ JOLT_PWD="$PWD" /path/to/casselc-jolt/bin/jolt \
   -M:test "pipelining" "keep-alive"
 ```
 
-The current reviewed aspect-capable core baseline is
-`c666a2d0175923cb7edeb36fb99c7e2c657af375`. `deps.edn` pins jolt-tcp at
-`6245307eb5890d0addb10c0f8e4e3b7a55f5b85c`, which transitively pins jolt-net
-at `f2ea68d9adc5a6d7b66cb511351e98e93081aee2`.
+The suite requires Jolt 0.8 or newer. `deps.edn` pins jolt-tcp at
+`85f67fb76c4c6d392f5dd51821e458d446ebae01`, which transitively pins jolt-net
+at `5201c40a6da38bdda337e249476033a4aabf13dd`.
 
 Progress is also written to `/tmp/jolt-http-test-progress.log`; jolt block-buffers
 stdout when it is redirected, so on a hang that file is the only record of how
