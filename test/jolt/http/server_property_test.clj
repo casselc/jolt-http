@@ -460,27 +460,32 @@
     (with-server {:handler hello-handler :read-buffer-size buf-size}
       (fn [port]
         (guarded
-         "a request line or header just under the read buffer is served, just over is refused"
+         "a request line or header at the read-buffer limit is served, above it is refused"
          (fn []
            (h/run-test!
             (assoc run-opts :test-cases 25 :name "server/oversize")
             (fn [_]
-              ;; The bound is `(< (buf/limit buffer) max-buffer-size)`, so the
-              ;; interesting inputs are the ones either side of it — not one
-              ;; arbitrarily huge URI. The generator straddles the boundary
-              ;; directly, and integer shrinking walks straight to it.
+              ;; The bound applies to one line, not the total request. The
+              ;; configured size is inclusive: a complete line including CRLF
+              ;; is accepted at capacity and rejected above capacity. The
+              ;; generator straddles that per-line boundary directly.
               (g/let [pad-len (g/integer 1 (* 2 buf-size))
                       in-uri? (g/boolean)]
-                (let [pad  (apply str (repeat pad-len "x"))
-                      raw  (if in-uri?
-                             (str "GET /" pad " HTTP/1.1\r\nHost: h\r\n\r\n")
-                             (str "GET / HTTP/1.1\r\nHost: h\r\nX-Big: " pad "\r\n\r\n"))
-                      over? (>= (count raw) buf-size)
+                (let [pad          (apply str (repeat pad-len "x"))
+                      request-line (str "GET /" pad " HTTP/1.1\r\n")
+                      header-line  (str "X-Big: " pad "\r\n")
+                      raw          (if in-uri?
+                                     (str request-line "Host: h\r\n\r\n")
+                                     (str "GET / HTTP/1.1\r\nHost: h\r\n"
+                                          header-line "\r\n"))
+                      line-size    (count (if in-uri? request-line header-line))
+                      over?       (> line-size buf-size)
                       want  (cond (not over?) 200
                                   in-uri?     414
                                   :else       431)
                       got   (exchange port [(m/ascii raw)])]
-                  (h/fprn :pad-len pad-len :in-uri? in-uri? :raw-len (count raw) :over? over?)
+                  (h/fprn :pad-len pad-len :in-uri? in-uri?
+                          :line-size line-size :raw-len (count raw) :over? over?)
                   (check-drain! "server/oversize" got {:pad-len pad-len :over? over?})
                   (let [{:keys [responses error]} (m/read-responses got)]
                     (when error
@@ -490,7 +495,8 @@
                     (when-not (= want (:status (first responses)))
                       (fail! "server/oversize/status"
                              {:want want :got (:status (first responses))
-                              :raw-len (count raw) :over? over? :in-uri? in-uri?})))))))))))))
+                              :line-size line-size :raw-len (count raw)
+                              :over? over? :in-uri? in-uri?})))))))))))))
 
 ;; --- 8. stateful connection model over real transport ----------------------
 
