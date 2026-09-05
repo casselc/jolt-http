@@ -210,17 +210,21 @@
   "Wrap a known-length writer as a single HTTP chunk plus the terminating
   zero-length chunk."
   [writerf len]
-  (let [header (buf/wrap (ascii-bytes (format "%X\r\n" len)))
-        end    (buf/wrap end-chunk)
-        index  (volatile! 0)]
-    (fn [write-buf]
-      (let [idx (long @index)]
-        (when (case idx
-                0 (copy-buffer header write-buf)
-                1 (writerf write-buf)
-                2 (copy-buffer end write-buf))
-          (vreset! index (inc idx))
-          (>= idx 2))))))
+  (if (zero? (long len))
+    (let [last-chunk (buf/wrap empty-chunk)]
+      (fn [write-buf]
+        (copy-buffer last-chunk write-buf)))
+    (let [header (buf/wrap (ascii-bytes (format "%X\r\n" len)))
+          end    (buf/wrap end-chunk)
+          index  (volatile! 0)]
+      (fn [write-buf]
+        (let [idx (long @index)]
+          (when (case idx
+                  0 (copy-buffer header write-buf)
+                  1 (writerf write-buf)
+                  2 (copy-buffer end write-buf))
+            (vreset! index (inc idx))
+            (>= idx 2)))))))
 
 ;; --- sinks -----------------------------------------------------------------
 

@@ -230,6 +230,16 @@
             (h/fprn :minimal-len (count payload) :off off :len len :cap cap)
             (is (= (subvec payload off (+ off len)) got))))))
 
+(deftest empty-known-length-chunk-is-one-terminator
+  (let [empty-body (byte-array 0)
+        expected   (m/ascii "0\r\n\r\n")]
+    (doseq [cap (range 1 6)]
+      (is (= expected
+             (drive-writer
+              (body/chunk-writer (body/bytes-writer empty-body 0 0) 0)
+              cap))
+          (str "capacity " cap " emits exactly one last chunk")))))
+
 (deftest chunk-writer-emits-one-chunk-and-a-terminator
   (with (assoc opts :name "body/chunk-writer")
         [payload (g/vector {:max-size 1024} (g/octet))
@@ -239,8 +249,10 @@
     ;; chunk-writer has to hold that shape across a buffer that fills anywhere.
         (let [bs       (m/->ba payload)
               n        (alength bs)
-              expected (into (m/ascii (str (format "%X" n) "\r\n"))
-                             (into (vec payload) (m/ascii "\r\n0\r\n\r\n")))
+              expected (if (zero? n)
+                         (m/ascii "0\r\n\r\n")
+                         (into (m/ascii (str (format "%X" n) "\r\n"))
+                               (into (vec payload) (m/ascii "\r\n0\r\n\r\n"))))
               got      (drive-writer (body/chunk-writer (body/bytes-writer bs 0 n) n) cap)]
           (h/fprn :minimal-len n :cap cap)
           (is (= expected got)))))
