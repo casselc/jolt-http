@@ -161,9 +161,11 @@
            ::error   :http-version-not-supported
            ::request {:bad-protocol protocol}})))
     (cond
-      ;; The oversize check comes first: a request line that has filled the read
-      ;; buffer is a 414 whether or not the peer is still there.
-      (not (< (buf/limit buffer) (long max-buffer-size)))
+      ;; The oversize check comes first: an unconsumed request line that fills
+      ;; the read buffer is a 414 whether or not the peer is still there. Use
+      ;; remaining bytes, not the view's total limit: a complete line may have
+      ;; consumed an exactly-full view before this state is entered again.
+      (not (< (buf/remaining buffer) (long max-buffer-size)))
       {::step :error, ::error :uri-too-long}
 
       ;; No request line, nothing buffered, and the peer's terminal notification
@@ -257,7 +259,10 @@
            (assoc! state ::header-bytes bytes' ::header-count count')
            line))))
     (cond
-      (not (< (buf/limit buffer) (long max-buffer-size)))
+      ;; Consumed fields may leave a partial field at a nonzero position in a
+      ;; full view. The reactor can compact that prefix and read more; only an
+      ;; unconsumed field that itself fills the capacity is too large.
+      (not (< (buf/remaining buffer) (long max-buffer-size)))
       {::step :error, ::error :request-header-field-too-large}
 
       (tcp/peer-eof-notified? socket)
