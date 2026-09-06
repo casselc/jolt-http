@@ -977,15 +977,37 @@
                                         "5\r\nhello0\r\n\r\n")))))))
 
 (defn- test-oversized []
-  (with-server {:handler hello-handler :read-buffer-size 1024}
+  (let [buf-size 1024
+        uri-fixed (count "GET / HTTP/1.1\r\n")
+        header-fixed (count "X-Big: \r\n")]
+    (with-server {:handler hello-handler :read-buffer-size buf-size}
     (fn [p]
+      (check "request line at read-buffer capacity is accepted" 200
+             (status-of
+              (request p (str "GET /" (str/join (repeat (- buf-size uri-fixed) "x"))
+                              " HTTP/1.1\r\nHost: localhost\r\n"
+                              "Connection: close\r\n\r\n"))))
+      (check "request line one byte over read-buffer capacity -> 414" 414
+             (status-of
+              (request p (str "GET /" (str/join (repeat (inc (- buf-size uri-fixed)) "x"))
+                              " HTTP/1.1\r\nHost: localhost\r\n\r\n"))))
+      (check "header line at read-buffer capacity is accepted" 200
+             (status-of
+              (request p (str "GET / HTTP/1.1\r\nHost: localhost\r\nX-Big: "
+                              (str/join (repeat (- buf-size header-fixed) "y"))
+                              "\r\nConnection: close\r\n\r\n"))))
+      (check "header line one byte over read-buffer capacity -> 431" 431
+             (status-of
+              (request p (str "GET / HTTP/1.1\r\nHost: localhost\r\nX-Big: "
+                              (str/join (repeat (inc (- buf-size header-fixed)) "y"))
+                              "\r\n\r\n"))))
       (check "long uri -> 414" 414
              (status-of (request p (str "GET /" (str/join (repeat 2000 "x"))
                                         " HTTP/1.1\r\nHost: localhost\r\n\r\n"))))
       (check "long header -> 431" 431
              (status-of (request p (str "GET / HTTP/1.1\r\nHost: localhost\r\n"
                                         "X-Big: " (str/join (repeat 2000 "y"))
-                                        "\r\n\r\n")))))))
+                                        "\r\n\r\n"))))))))
 
 (defn- test-aggregate-header-limits []
   ;; The section-byte limit counts every field's CRLF and the final blank CRLF.
