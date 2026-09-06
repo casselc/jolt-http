@@ -24,11 +24,18 @@
             ;; discovered by clojure.test/run-tests, the loopback properties by
             ;; run-properties!.
             [jolt.http.body-property-test]
-            [jolt.http.protocol-property-test]
+            [jolt.http.protocol-property-test :as protocol-properties]
             [jolt.http.server-property-test]))
 
 (def ^:private failures (atom 0))
 (def ^:private checks (atom 0))
+(def ^:private abort-suite? (atom false))
+(def ^:private active-context (atom nil))
+
+;; Progress is written to a file as well as printed: jolt block-buffers stdout
+;; when it is piped or redirected, so on a hang the file is the durable record
+;; of the active property, seed, and runner phase.
+(def ^:private progress-file "/tmp/jolt-http-test-progress.log")
 
 (defn- check [label expected actual]
   (swap! checks inc)
@@ -45,6 +52,133 @@
     (println "ok  " label)
     (do (swap! failures inc)
         (println "FAIL" label "\n   got:" (pr-str actual)))))
+
+(defn- positive-env-ms [name default-ms]
+  (if-let [raw (System/getenv name)]
+    (let [n (parse-long raw)]
+      (when-not (and n (pos? n))
+        (throw (ex-info (str name " must be a positive integer")
+                        {:name name :value raw})))
+      n)
+    default-ms))
+
+(def ^:private protocol-property-timeout-ms
+  (positive-env-ms "JOLT_HTTP_PROTOCOL_PROPERTY_TIMEOUT_MS" 60000))
+
+(defn- fresh-property-seed [property]
+  (bit-and 9223372036854775807
+           (bit-xor (System/nanoTime)
+                    (bit-xor (System/currentTimeMillis)
+                             (bit-xor (hash property)
+                                      (rand-int 2147483647))))))
+
+(defn- context-text [context]
+  (when context
+    (str " [property=" (:property context)
+         " seed=" (:seed context)
+         " phase=" (:phase context) "]")))
+
+(defn- record-context! [context]
+  (reset! active-context context)
+  (spit progress-file (str "ACTIVE " (pr-str context) "\n") :append true))
+
+(defn- await-bounded
+  "Run f asynchronously and return a data verdict rather than reporting it.
+
+  Returning the future lets the timeout control release and join its deliberate
+  blocker. Production exits the suite immediately after a timeout because Jolt
+  does not expose cooperative future cancellation."
+  [f timeout-ms]
+  (let [done (future
+               (try {:status :ok :value (f)}
+                    (catch :default e {:status :threw :error e})))
+        result (deref done timeout-ms ::timeout)]
+    (if (= ::timeout result)
+      {:status :timeout :future done}
+      result)))
+
+(defn- apply-timeout-policy! [abort-on-timeout?]
+  (when abort-on-timeout?
+    (reset! abort-suite? true)))
+
+(defn- validate-fault-selectors! [available forced-hang forced-throw]
+  (when (and forced-hang forced-throw)
+    (throw (ex-info "hang and throw fault selectors are mutually exclusive"
+                    {:hang forced-hang :throw forced-throw})))
+  (doseq [[env-name selected]
+          [["JOLT_HTTP_FAULT_HANG_PROPERTY" forced-hang]
+           ["JOLT_HTTP_FAULT_THROW_PROPERTY" forced-throw]]]
+    (when (and selected (not (contains? available selected)))
+      (throw (ex-info (str env-name " did not select a property")
+                      {:value selected :available (sort available)})))))
+
+(defn- run-bounded! [label f timeout-ms abort-on-timeout?]
+  (let [{:keys [status error]} (await-bounded f timeout-ms)]
+    (case status
+      :ok true
+      :threw
+      (let [message (str "FAIL " label " threw: " (ex-message error)
+                         (context-text @active-context))]
+        (swap! failures inc)
+        (println message)
+        (spit progress-file (str message "\n") :append true)
+        false)
+      :timeout
+      (let [message (str "FAIL " label " timed out after " timeout-ms " ms"
+                         (context-text @active-context))]
+        (swap! failures inc)
+        (apply-timeout-policy! abort-on-timeout?)
+        (println message)
+        (spit progress-file (str message "\n") :append true)
+        false))))
+
+(defn- test-watchdog-controls []
+  (let [gate (promise)
+        completed (await-bounded (fn [] :done) 1000)
+        threw (await-bounded
+               (fn [] (throw (ex-info "control failure" {}))) 1000)
+        timed-out (await-bounded (fn [] (deref gate)) 100)
+        fixture-state @clojure.test/once-fixtures
+        fixture-rejected?
+        (try
+          (swap! clojure.test/once-fixtures
+                 assoc 'jolt.http.protocol-property-test [(fn [f] (f))])
+          (try
+            (protocol-properties/assert-unfixtured-runner!)
+            false
+            (catch :default _ true))
+          (finally
+            (reset! clojure.test/once-fixtures fixture-state)))
+        dual-fault-rejected?
+        (try
+          (validate-fault-selectors! #{"control"} "control" "control")
+          false
+          (catch :default _ true))]
+    (deliver gate :released)
+    ;; Join the deliberately blocked worker after releasing it so the positive
+    ;; suite never leaves a hidden future behind.
+    (deref (:future timed-out) 1000 ::join-timeout)
+    (check "watchdog allows a completed action" :ok (:status completed))
+    (check "watchdog preserves a thrown action" :threw (:status threw))
+    (check "watchdog detects a deliberately blocked action"
+           :timeout (:status timed-out))
+    (check "watchdog timeout context is non-vacuous"
+           " [property=control/hang seed=4242 phase=:hegel-run]"
+           (context-text {:property 'control/hang
+                          :seed 4242
+                          :phase :hegel-run}))
+    (reset! abort-suite? false)
+    (apply-timeout-policy! false)
+    (check "ordinary scenario timeout preserves suite continuation"
+           false @abort-suite?)
+    (apply-timeout-policy! true)
+    (check "protocol timeout aborts before another property starts"
+           true @abort-suite?)
+    (check "per-var runner rejects unhandled namespace fixtures"
+           true fixture-rejected?)
+    (check "hang and throw fault selectors are mutually exclusive"
+           true dual-fault-rejected?)
+    (reset! abort-suite? false)))
 
 (defn- utf8 ^bytes [s] (.getBytes ^String s "UTF-8"))
 (defn- ->str [^bytes b] (when b (String. b "UTF-8")))
@@ -1413,7 +1547,49 @@
   (run-clojure-test-ns 'jolt.http.body-property-test))
 
 (defn- test-protocol-properties []
-  (run-clojure-test-ns 'jolt.http.protocol-property-test))
+  (let [vars (protocol-properties/test-vars-in-source-order)
+        before {:pass (clojure.test/n-pass)
+                :fail (clojure.test/n-fail)
+                :error (clojure.test/n-error)}
+        started (atom 0)
+        forced-hang (System/getenv "JOLT_HTTP_FAULT_HANG_PROPERTY")
+        forced-throw (System/getenv "JOLT_HTTP_FAULT_THROW_PROPERTY")
+        available (set (map #(str (:name (meta %))) vars))]
+    (protocol-properties/assert-unfixtured-runner!)
+    (validate-fault-selectors! available forced-hang forced-throw)
+    (doseq [v vars :while (not @abort-suite?)]
+      (let [property (:name (meta v))
+            seed (fresh-property-seed property)
+            context {:property property :seed seed :phase :hegel-run}]
+        (swap! started inc)
+        (record-context! context)
+        (run-bounded!
+         (str "protocol property " property)
+         (fn []
+           ;; Fault injection is opt-in and occurs only after the replay seed
+           ;; and active var are durable, so the negative control exercises the
+           ;; same watchdog/report path as a real stuck property.
+           (when (= forced-hang (str property))
+             (deref (promise)))
+           (when (= forced-throw (str property))
+             (throw (ex-info "injected protocol property failure"
+                             {:property property :seed seed})))
+           (protocol-properties/run-test-var-with-seed! v seed))
+         protocol-property-timeout-ms
+         true)))
+    (let [after {:pass (clojure.test/n-pass)
+                 :fail (clojure.test/n-fail)
+                 :error (clojure.test/n-error)}
+          passed (- (:pass after) (:pass before))
+          failed (- (:fail after) (:fail before))
+          errored (- (:error after) (:error before))]
+      (println)
+      (println (str "Ran " @started " protocol properties. "
+                    passed " assertions passed, "
+                    failed " failures, " errored " errors."))
+      (swap! failures + failed errored)
+      (swap! checks + passed))
+    (reset! active-context nil)))
 
 (defn- test-loopback-properties []
   (let [before (jolt.http.server-property-test/failure-count)]
@@ -1448,7 +1624,8 @@
 ;; --- runner ----------------------------------------------------------------
 
 (def ^:private scenarios
-  [["inert aspect manifest" test-inert-aspect-manifest]
+  [["watchdog controls"    test-watchdog-controls]
+   ["inert aspect manifest" test-inert-aspect-manifest]
    ["date formatting"      test-date-formatting]
    ["charset parsing"      test-charset-parsing]
    ["basic response"       test-basic]
@@ -1515,34 +1692,25 @@
    ;; hundreds of generated cases, and on a shrink it replays the property again
    ;; from scratch.
    ["pure properties"      test-pure-properties      180000]
-   ["protocol properties"  test-protocol-properties  300000]
+   ["protocol properties"  test-protocol-properties  300000 true]
    ["loopback properties"  test-loopback-properties  600000]])
-
-;; Progress is written to a file as well as printed: jolt block-buffers stdout
-;; when it is piped or redirected, so on a hang the printed output is lost and
-;; this file is the only record of how far the run got.
-(def ^:private progress-file "/tmp/jolt-http-test-progress.log")
 
 (defn -main [& args]
   (let [only (set args)]
+    (reset! abort-suite? false)
+    (reset! active-context nil)
     (spit progress-file "start\n")
-    (doseq [[label f timeout-ms] scenarios]
-      (when (or (empty? only) (contains? only label))
+    (doseq [[label f timeout-ms abort-on-timeout?] scenarios]
+      (when (and (not @abort-suite?)
+                 (or (empty? only) (contains? only label)))
         (println (str "\n== " label " =="))
         (spit progress-file (str "BEGIN " label "\n") :append true)
         ;; Watchdog. The loopback client does a blocking recv with no socket
         ;; timeout, so a response that never arrives would hang the run forever
         ;; instead of failing it. Bound each scenario and report a timeout as a
         ;; failure so CI stays informative.
-        (let [done (future
-                     (try (f) :ok
-                          (catch :default e
-                            (swap! failures inc)
-                            (println "FAIL" label "threw:" (ex-message e))
-                            :threw)))]
-          (when (= :TIMEOUT (deref done (or timeout-ms 60000) :TIMEOUT))
-            (swap! failures inc)
-            (println "FAIL" label "timed out after" (or timeout-ms 60000) "ms")))
+        (run-bounded! label f (or timeout-ms 60000)
+                      (boolean abort-on-timeout?))
         (spit progress-file (str "END   " label "\n") :append true))))
   (println (str "\n" @checks " checks, " @failures " failures"))
   (flush)

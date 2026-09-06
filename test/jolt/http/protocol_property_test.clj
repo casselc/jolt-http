@@ -35,6 +35,42 @@
 (def ^:private opts
   {:test-cases 200 :database "" :verbosity :quiet})
 
+(defn test-vars-in-source-order
+  "Return this namespace's property vars in stable source order.
+
+  The acceptance runner uses the individual vars so a watchdog can name the
+  property that is still active. This remains discovery-based: adding a new
+  deftest automatically adds it to the run."
+  []
+  (->> (vals (ns-interns 'jolt.http.protocol-property-test))
+       (filter #(some? (:test (meta %))))
+       (sort-by #(vector (or (:line (meta %)) 0)
+                         (str (:name (meta %)))))))
+
+(defn run-test-var-with-seed!
+  "Run one property var with an explicit replayable Hegel seed.
+
+  `opts` is the common base read by every property. Binding its root only for
+  this synchronous var invocation preserves each property's own :name and
+  :test-cases overrides while making the seed observable before Hegel starts."
+  [v seed]
+  (with-redefs [opts (assoc opts :seed seed)]
+    (binding [clojure.test/*testing-vars*
+              (conj clojure.test/*testing-vars* v)]
+      ((:test (meta v))))))
+
+(defn assert-unfixtured-runner!
+  "Fail closed if this namespace gains fixtures the per-var runner would skip."
+  []
+  (let [ns-sym 'jolt.http.protocol-property-test
+        once (get @clojure.test/once-fixtures ns-sym)
+        each (get @clojure.test/each-fixtures ns-sym)]
+    (when (or (seq once) (seq each))
+      (throw (ex-info "protocol property runner does not support fixtures"
+                      {:namespace ns-sym
+                       :once (count once)
+                       :each (count each)})))))
+
 ;; --- handlers --------------------------------------------------------------
 
 (defn- echo-request-handler
