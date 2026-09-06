@@ -11,6 +11,10 @@ each request into a String, served one request per connection, and always closed
 Supports HTTP/1.1 only: keep-alive, pipelining, chunked request and response
 bodies, streaming request bodies, file responses, and async handlers.
 
+Development and pull requests use the permanent [`main`](docs/BRANCHING.md)
+integration branch. The branch policy and legacy-ref provenance are documented
+for both humans and automation.
+
 [capra]: https://github.com/weavejester/capra
 [jolt]: https://github.com/jolt-lang/jolt
 [jolt-tcp]: https://github.com/casselc/jolt-tcp

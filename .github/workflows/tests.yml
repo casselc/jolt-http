@@ -3,6 +3,21 @@ name: tests
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
+  branch-policy:
+    name: canonical branch policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify canonical ancestry and pull-request base
+        shell: bash
+        env:
+          CANONICAL_SUBJECT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          script/check-canonical-branch.sh "$CANONICAL_SUBJECT"
+          script/test-canonical-branch.sh
+
   test:
     name: POSIX runtime suite (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
